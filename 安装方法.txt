@@ -1,0 +1,36 @@
+JEQ 安装方法
+============
+
+系统要求
+--------
+macOS 14.4 或更高版本，并安装 Xcode Command Line Tools。
+
+一键安装
+--------
+1. 打开「终端」。
+2. 进入本仓库目录：
+
+   cd /path/to/JEQ
+
+3. 运行：
+
+   bash ./install.command
+
+安装脚本会：
+
+  - 编译 build/JEQ.app；
+  - 退出正在运行的 JEQ / SubEQ；
+  - 只保留一份到 /Applications/JEQ.app（无写权限时使用 ~/Applications）；
+  - 自动启动 JEQ。
+
+注意
+----
+JEQ 是菜单栏应用，启动后没有 Dock 图标或主窗口。图标会出现在屏幕右上角菜单栏。
+
+首次启用处理时，macOS 会请求「系统音频录制」权限。该权限用于读取系统输出混音并实时处理，
+音频只在本机内存中处理，不录制、不落盘、不上传。
+
+如果 Finder 双击 install.command 没有打开终端，可以右键选择「打开」，或在终端执行：
+
+   chmod +x install.command
+   ./install.command

@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+DerivedData/
+.build/
+
+# Local preferences and backups (may contain personal audio/EQ settings)
+backups/
+.restore-custom
+*.plist.backup
+
+# Local-only helper scripts and editor state
+restore_custom.command
+.claude/
+.DS_Store
+*.xcuserstate
+
+# Superseded UI screenshots
+docs_panel.png
+docs_panel_advanced.png
