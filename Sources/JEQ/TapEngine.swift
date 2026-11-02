@@ -45,6 +45,7 @@ final class TapEngine {
 
     private var states: [BiquadState] = (0..<ParamStore.maxChannels).map { _ in BiquadState(capacity: ParamStore.maxBands) }
     private var tapStreamIndex = -1
+    private var hearingGuard = HearingGuardEnvelope()
 
     /// 诊断用：把 DSP 前后的样本各存一份，供离线校验（仅 --liveproof 打开）
     final class CaptureBuffer {
@@ -368,6 +369,7 @@ final class TapEngine {
         params.refreshSnapshot()
         if params.snapReset {
             for s in states { s.reset() }
+            hearingGuard.reset()
         }
 
         let inBL = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
@@ -391,8 +393,14 @@ final class TapEngine {
         let pre = params.snapPreamp
         let make = params.snapMakeup
         let clip = params.snapLimiter
-        // 输出达到软限幅膝点就认作“限幅介入”；关了限幅则按 0 dBFS 算削波
-        let outClipThreshold: Float = clip ? DSPLimits.outputWarnLevel : 0.999
+        let guardOn = params.snapHearingGuard
+        let guardCeiling = params.snapHearingCeiling
+        let guardRelease = Float(1 - exp(-1 / (Double(sampleRate) * 0.5)))
+        if !guardOn { hearingGuard.reset() }
+        // 开启护耳时，输出到达设定上限即视为保护介入；否则按软限幅/0 dBFS 判断。
+        let outClipThreshold: Float = guardOn
+            ? min(DSPLimits.outputWarnLevel, guardCeiling * 1.002)
+            : (clip ? DSPLimits.outputWarnLevel : 0.999)
 
         for (oi, ob) in outBL.enumerated() {
             guard let op = ob.mData?.assumingMemoryBound(to: Float.self) else { continue }
@@ -415,9 +423,7 @@ final class TapEngine {
                 let offset = planarInput ? 0 : min(c, inch - 1)
                 let st = states[min(c, chPairs - 1)]
                 var chInPeak: Float = 0
-                var chOutPeak: Float = 0
                 var chInSq: Float = 0
-                var chOutSq: Float = 0
                 for f in 0..<frames {
                     var x = ip[f * stride + offset]
                     if !x.isFinite { x = 0 }
@@ -428,35 +434,20 @@ final class TapEngine {
                     var y = x * pre
                     if nBands > 0 { y = st.process(y, coeffs: coeffs, count: nBands) }
                     y *= make
-                    // 限幅必须是最后一级，否则增益会突破保护阈值
-                    if clip {
-                        y = DSPLimits.softLimit(y)
-                    }
-                    let ay = abs(y)
-                    if ay > chOutPeak { chOutPeak = ay }
-                    if ay >= outClipThreshold { outClipped = true }
-                    chOutSq += y * y
                     if c == 0, capture.active, capture.count < capture.capacity {
                         capture.inBuf[capture.count] = x
-                        capture.outBuf[capture.count] = y
-                        capture.count += 1
                     }
                     op[f * och + c] = y
                 }
                 if c == 0 {
                     inPkL = chInPeak; inSqL = chInSq
-                    outPkL = chOutPeak; outSqL = chOutSq
                 } else if c == 1 {
                     inPkR = chInPeak; inSqR = chInSq
-                    outPkR = chOutPeak; outSqR = chOutSq
                 }
             }
-            // 单声道设备：右声道与左声道同值，表头仍显示两条，避免看起来缺一路
-            if och < 2 {
-                inPkR = inPkL; inSqR = inSqL
-                outPkR = outPkL; outSqR = outSqL
-            }
-            // 输出通道比输入多时静音补齐
+
+            // 护耳必须做立体声联动：同一帧所有声道使用同一个增益，
+            // 否则只有一侧峰值较大时会造成声像偏移。软限幅仍是最后一级。
             if och > chPairs {
                 for c in chPairs..<och {
                     for f in 0..<frames { op[f * och + c] = 0 }
@@ -464,6 +455,38 @@ final class TapEngine {
             }
             if frames < oFrames {
                 for f in frames..<oFrames { for c in 0..<och { op[f * och + c] = 0 } }
+            }
+
+            for f in 0..<frames {
+                var framePeak: Float = 0
+                for c in 0..<och { framePeak = max(framePeak, abs(op[f * och + c])) }
+                let linkedGain = guardOn
+                    ? hearingGuard.process(peak: framePeak, ceiling: guardCeiling,
+                                           releaseCoefficient: guardRelease)
+                    : 1
+                for c in 0..<och {
+                    var y = op[f * och + c] * linkedGain
+                    if clip { y = DSPLimits.softLimit(y) }
+                    let ay = abs(y)
+                    if c == 0 {
+                        outPkL = max(outPkL, ay)
+                        outSqL += y * y
+                    } else if c == 1 {
+                        outPkR = max(outPkR, ay)
+                        outSqR += y * y
+                    }
+                    if ay >= outClipThreshold { outClipped = true }
+                    if c == 0, capture.active, capture.count < capture.capacity {
+                        capture.outBuf[capture.count] = y
+                        capture.count += 1
+                    }
+                    op[f * och + c] = y
+                }
+            }
+            // 单声道设备：右声道与左声道同值，表头仍显示两条，避免看起来缺一路
+            if och < 2 {
+                inPkR = inPkL; inSqR = inSqL
+                outPkR = outPkL; outSqR = outSqL
             }
             _ = oi
 

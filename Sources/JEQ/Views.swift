@@ -254,11 +254,11 @@ struct LevelMeter: View {
                 MeterRow(label: "IN", left: m.inputL, right: m.inputR,
                          clipped: m.inputClip, clipHint: "输入削波（≥ 0 dBFS）")
                 MeterRow(label: "OUT", left: m.outputL, right: m.outputR,
-                         clipped: m.outputClip, clipHint: "限幅器介入或输出接近 0 dBFS")
+                         clipped: m.outputClip, clipHint: "护耳/限幅器介入或输出接近上限")
                 MeterScale()
             }
         }
-        .help("亮条＝峰值，白线＝RMS，细线＝峰值保持；每行上条＝左声道、下条＝右声道；右侧圆点：IN 削波 / OUT 限幅介入")
+        .help("亮条＝峰值，白线＝RMS，细线＝峰值保持；每行上条＝左声道、下条＝右声道；右侧圆点：IN 削波 / OUT 护耳或限幅介入")
     }
 }
 
@@ -386,7 +386,26 @@ struct PanelView: View {
                     .frame(width: 8, height: 8)
                     .overlay(Circle().stroke(statusColor.opacity(0.35), lineWidth: 3))
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(state.deviceName).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                    Button {
+                        state.showDeviceProfiles.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(state.deviceName)
+                                .font(.system(size: 11, weight: .semibold))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 7, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .help("查看已知设备与保存配置")
+                    .popover(isPresented: Binding(
+                        get: { state.showDeviceProfiles },
+                        set: { state.showDeviceProfiles = $0 }
+                    ), arrowEdge: .bottom) {
+                        DeviceProfilesView(state: state)
+                    }
                     Text(statusText).font(.system(size: 9)).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -410,6 +429,9 @@ struct PanelView: View {
         var t = state.statusLine
         if state.latencyMs > 0 { t += String(format: " · 延迟 %.1f ms", state.latencyMs) }
         t += " · " + state.sampleRateText
+        if state.settings.hearingGuard {
+            t += String(format: " · 护耳 %.0f dBFS", state.settings.hearingCeilingDB)
+        }
         return t
     }
 
@@ -681,6 +703,13 @@ struct PanelView: View {
             Toggle("启用", isOn: $state.enabled)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+            Toggle("护耳", isOn: Binding(
+                get: { state.settings.hearingGuard },
+                set: { state.setFlag(\.hearingGuard, $0) }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("自动限制大音量峰值；只压过大的瞬态，不做逐歌音量归一化")
             Spacer()
             Text("\(state.settings.bands.count) 个点")
                 .font(.system(size: 9))
@@ -713,6 +742,34 @@ struct PanelView: View {
                     .font(mono(9.5, .medium))
                     .foregroundStyle(state.settings.autoPreamp ? Color.green : Color.secondary)
                     .help("按当前最终曲线的最大正增益一次性计算；只随模式/曲线变化，绝不随歌曲电平起伏")
+            }
+
+            if state.settings.hearingGuard {
+                HStack(spacing: 7) {
+                    Image(systemName: "ear.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.orange)
+                    Text("最高输出")
+                        .font(.system(size: 10, weight: .medium))
+                    Text("护耳峰值上限")
+                        .font(.system(size: 8.5))
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Picker("护耳最高输出", selection: Binding(
+                        get: { state.settings.hearingCeilingDB },
+                        set: { state.setHearingCeiling($0) }
+                    )) {
+                        ForEach(DSPLimits.hearingCeilingOptions, id: \.self) { db in
+                            Text(String(format: "%.0f dBFS", db)).tag(db)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.mini)
+                    .frame(width: 94)
+                }
+                .transition(.opacity)
+                .help("超过该峰值的音量会被自动压低；较低数值保护更强")
             }
 
             HStack(spacing: 8) {

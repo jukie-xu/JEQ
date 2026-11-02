@@ -30,6 +30,8 @@ enum SelfTest {
         let st = BiquadState(capacity: ParamStore.maxBands)
         let pre = pow(10, settings.effectivePreampDB / 20)
         let make = pow(10, settings.trimDB / 20)
+        var hearingGuard = HearingGuardEnvelope()
+        let hearingRelease = 1 - exp(-1 / (Double(sr) * 0.5))
 
         func run(_ base: UnsafePointer<BiquadCoeff>?, _ count: Int) {
             for i in 0..<input.count {
@@ -38,6 +40,12 @@ enum SelfTest {
                     y = st.process(y, coeffs: base, count: count)
                 }
                 y *= make
+                if settings.hearingGuard {
+                    let g = hearingGuard.process(peak: y,
+                                                 ceiling: pow(10, settings.hearingCeilingDB / 20),
+                                                 releaseCoefficient: Float(hearingRelease))
+                    y *= g
+                }
                 if settings.limiter {
                     y = DSPLimits.softLimit(y)
                 }
@@ -324,6 +332,33 @@ enum SelfTest {
         check(BassSettings().curveDB(at: 60) == 0,
               "低音模块在关闭状态下明确清零")
 
+        var guarded = EQSettings()
+        guarded.hearingGuard = true
+        guarded.hearingCeilingDB = -6
+        guarded.autoPreamp = false
+        guarded.limiter = false
+        let guardedOut = process(sine(1_000, amp: 0.90, n: 48_000, sr: sr),
+                                 settings: guarded, sr: sr)
+        let guardedPeak = guardedOut[12_000...].map { abs($0) }.max() ?? 0
+        let expectedCeiling = pow(10, Float(-6) / 20)
+        check(guardedPeak <= expectedCeiling + 0.001,
+              "大音量护耳把峰值限制在设置上限",
+              String(format: "peak %.4f / ceiling %.4f", guardedPeak, expectedCeiling))
+
+        let quiet = guarded
+        let quietOut = process(sine(1_000, amp: 0.20, n: 12_000, sr: sr),
+                               settings: quiet, sr: sr)
+        let quietPeak = quietOut[6_000...].map { abs($0) }.max() ?? 0
+        check(quietPeak < expectedCeiling && abs(quietPeak - 0.20) < 0.002,
+              "低于上限的正常音量不被护耳改变")
+
+        var envelope = HearingGuardEnvelope()
+        let attack = envelope.process(peak: 1, ceiling: 0.5, releaseCoefficient: 1e-6)
+        check(abs(attack - 0.5) < 1e-5, "护耳攻击立即把峰值压到上限")
+        for _ in 0..<1_000 { _ = envelope.process(peak: 0, ceiling: 0.5, releaseCoefficient: 1e-6) }
+        check(envelope.gain < 0.501, "护耳释放缓慢，不会逐歌自动抬音量",
+              String(format: "gain %.4f", envelope.gain))
+
         // 全量程正弦 + 固定线性余量。关闭软限幅，直接验证预衰减足以避免削波。
         var safeFailures: [String] = []
         for scene in ScenePreset.allCases {
@@ -361,6 +396,8 @@ enum SelfTest {
         check(firstHeadroom <= -staticCheck.maxBoost,
               "固定余量至少覆盖整条曲线的最大正增益",
               String(format: "headroom %.2f / peak %.2f", firstHeadroom, staticCheck.maxBoost))
+        staticCheck.hearingGuard = true
+        staticCheck.hearingCeilingDB = -9
 
         let slot = CustomSlot(bands: staticCheck.bands,
                               base: nil,
@@ -373,7 +410,9 @@ enum SelfTest {
            let decoded = try? JSONDecoder().decode(PersistedState.self, from: data) {
             check(decoded.profile == .scene(.heavyBass)
                   && decoded.customSlot?.sceneBase == .heavyBass
-                  && decoded.customSlot?.bass == staticCheck.bass,
+                  && decoded.customSlot?.bass == staticCheck.bass
+                  && decoded.settings.hearingGuard
+                  && abs(decoded.settings.hearingCeilingDB + 9) < 0.01,
                   "场景与完整低音配置可无损持久化")
         } else {
             check(false, "场景与完整低音配置可无损持久化", "JSON 编解码失败")
@@ -457,11 +496,23 @@ enum SelfTest {
             state.persistPaused = true
             state.apply(.heavyBass)
         }
+        if CommandLine.arguments.contains("--demo-guard") {
+            state.persistPaused = true
+            state.setFlag(\.hearingGuard, true)
+            state.setHearingCeiling(-6)
+        }
         // 没有音频输入时电平表全是 0，离屏渲染看不出排版；喂一组固定读数
         state.meterDemoLevels = true
         state.refreshStatus()
-        let view = PanelView(state: state, snapshotMode: true)
-            .background(Color(nsColor: .windowBackgroundColor))
+        let showDevices = CommandLine.arguments.contains("--devices")
+        let view = Group {
+            if showDevices {
+                DeviceProfilesView(state: state, snapshotMode: true)
+            } else {
+                PanelView(state: state, snapshotMode: true)
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
         guard let img = renderer.nsImage,
@@ -477,8 +528,10 @@ enum SelfTest {
         if let i = args.firstIndex(of: "--out"), i + 1 < args.count {
             outDir = URL(fileURLWithPath: args[i + 1], isDirectory: true)
         }
-        let path = outDir
-            .appendingPathComponent(state.showAdvanced ? "jeq_panel_adv.png" : "jeq_panel.png").path
+        let fileName: String
+        if showDevices { fileName = "jeq_devices.png" }
+        else { fileName = state.showAdvanced ? "jeq_panel_adv.png" : "jeq_panel.png" }
+        let path = outDir.appendingPathComponent(fileName).path
         do {
             try png.write(to: URL(fileURLWithPath: path))
             print("✓ 面板已渲染: \(path)  尺寸 \(img.size)")

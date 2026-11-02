@@ -105,6 +105,9 @@ Process tap 从 macOS 14.4 起可用：系统把「所有进程送往输出的�
   音量忽高忽低。正增益被线性抵消后，低音相对其他频段的提升仍然保留。
 - **末级软限幅**：只在极端瞬态超过约 −0.22 dBFS 时介入，渐近上限约 −0.01 dBFS，
   `tanh` 平滑，无硬削波。正常曲线下固定余量已经足够，限幅器基本不介入。
+- **大音量护耳（可选，默认关闭）**：开启后用立体声联动的峰值限制器自动压低超过上限的瞬态。
+  上限可在 `−3 / −6 / −9 / −12 dBFS` 中选择；攻击即时、释放约 0.5 秒，只限制峰值，
+  不做逐歌曲响度归一化，也不会在两首歌之间自动抬高或降低音量。
 - 另有手动 Trim，可只改输出响度，不进频响曲线。
 - 系数用 RBJ Audio EQ Cookbook，Direct Form II Transposed，Float 单精度。
 - 参数发布：UI 线程 `os_unfair_lock` 写入，音频线程 `trylock` + 独立快照缓冲区，
@@ -149,7 +152,16 @@ Process tap 从 macOS 14.4 起可用：系统把「所有进程送往输出的�
 右键 DIY 可回到基础预设、用当前音效覆盖或删除。
 自定义卡按输出设备分别保存。旧版本的 8 段/4 段曲线会按原样迁移，不会因为升级被改写。
 
-固定防爆音余量、Trim、限幅和开机启动属于全局处理选项，不写进卡片。
+固定防爆音余量、Trim、限幅、大音量护耳和开机启动属于全局处理选项，不写进卡片。
+
+### 已知设备配置
+
+每台输出设备仍会按 Core Audio UID 自动保存完整配置：场景/经典预设、DIY、低音模块、
+清晰度和护耳设置都会随设备切换自动载回。点击顶栏设备名旁的下拉箭头可以查看已知设备：
+
+- **立即保存**：强制把当前设备配置写入本地存档；
+- **载入**：把另一台已知设备的配置复制到当前输出设备，原设备配置仍保留；
+- 非当前设备的保存配置可以右键删除；当前设备配置不能直接删除，避免误覆盖正在使用的声音。
 
 ### 低音模块
 
@@ -223,10 +235,10 @@ bash ./install.command
 ```bash
 JEQ.app/Contents/MacOS/JEQ --selftest    # 离线：理论频响 vs 实测增益
 JEQ.app/Contents/MacOS/JEQ --curvetest   # 整条曲线拖动：平移 / 移频 / 边界夹取
-JEQ.app/Contents/MacOS/JEQ --modetest    # 标准 10 段 / 场景 / 低音模块 / 固定余量防削波
+JEQ.app/Contents/MacOS/JEQ --modetest    # 标准 10 段 / 场景 / 低音模块 / 护耳 / 固定余量防削波
 JEQ.app/Contents/MacOS/JEQ --metertest   # 电平表弹道：回落 / 峰值保持 / 削波灯
 JEQ.app/Contents/MacOS/JEQ --liveproof deepSub   # 实时：tap→DSP→设备 端到端
-JEQ.app/Contents/MacOS/JEQ --snapshot [--advanced] [--out <目录>]  # 离屏渲染面板
+JEQ.app/Contents/MacOS/JEQ --snapshot [--advanced] [--devices] [--demo-guard] [--out <目录>]  # 离屏渲染面板
 ```
 
 `--curvetest`、`--modetest` 与 `--metertest` 都是断言测试，不需要音频设备，失败时退出码非 0。
@@ -263,7 +275,9 @@ JEQ.app/Contents/MacOS/JEQ --snapshot [--advanced] [--out <目录>]  # 离屏渲
 - 曲线直接编辑（纯图形）：节点压在曲线上，拖动只影响相邻段；抓曲线本体可整体平移增益、⌥ 拖动整体移频；双击加节点、右键菜单、方向键微调；频率标签贴在节点上随波形移动
 - 5 个场景 + 6 个兼容旧版的经典预设 + 一张保存完整音色模块的常驻「DIY」卡
 - 输入 / 输出立体声电平表：峰值 + RMS + 峰值保持、dBFS 刻度、输入削波与限幅介入指示；参数改动即时生效（10 ms 内）
-- 按输出设备记忆配置（含自定义卡）；输出设备切换自动重建引擎
+- 已知输出设备管理：按设备 UID 自动保存/载回配置，支持立即保存、跨设备复用和非当前配置删除
+- 可选大音量护耳：`−3 / −6 / −9 / −12 dBFS` 峰值上限，立体声联动，只压瞬态
+- 按输出设备记忆配置（含 DIY 卡）；输出设备切换自动重建引擎
 - 引擎重启、错误回显、旁通
 - 应用图标 + 菜单栏模板图标；开机启动开关（系统登录项优先，LaunchAgent 后备）
 
@@ -292,6 +306,8 @@ JEQ/
 │   ├── EQParams.swift           控制点 / 曲线插值 / 预设 / 滤波器组 / 实时参数发布
 │   ├── TapEngine.swift          tap + 聚合设备 + IOProc + DSP 渲染
 │   ├── AppState.swift           状态、自定义卡、持久化、设备切换、旧配置迁移
+│   ├── DeviceProfiles.swift     已知设备配置记录模型
+│   ├── DeviceProfilesView.swift 已知设备列表、立即保存与跨设备载入
 │   ├── LaunchAtLogin.swift      开机启动（SMAppService → LaunchAgent 后备）
 │   ├── CurveEditor.swift        可交互频响曲线（节点拖动 / 整条曲线拖动 / 右键 / 键盘）
 │   ├── Meters.swift             电平表数据与表头弹道（峰值 / RMS / 保持 / 削波）

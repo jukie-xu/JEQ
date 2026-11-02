@@ -34,6 +34,9 @@ final class AppState: ObservableObject {
     }
 
     @Published var showAdvanced: Bool = false
+    @Published var showDeviceProfiles: Bool = false
+    @Published private(set) var knownDevices: [KnownDeviceProfile] = []
+    @Published private(set) var deviceConfigNotice: String?
     @Published private(set) var selectedBandID: UUID?
     @Published private(set) var statusLine: String = "未启动"
     @Published private(set) var deviceName: String = "—"
@@ -47,6 +50,8 @@ final class AppState: ObservableObject {
     /// 当前设备 UID 的缓存：拖动曲线时每次改参数都要落盘，
     /// 不能每个事件都去问 CoreAudio。
     private var currentUID: String = ""
+
+    var currentDeviceUID: String { currentUID }
 
     /// 诊断命令（--liveproof）期间关闭落盘，避免测试参数覆盖用户配置
     var persistPaused = false
@@ -103,6 +108,7 @@ final class AppState: ObservableObject {
         profile = resolved.profile
         customSlot = resolved.slot
         selectedBandID = resolved.settings.bands.first?.id
+        loadKnownDeviceRegistry()
 
         // 把（可能是旧格式的）状态统一写成一份 state.v2，完成一次性迁移
         persistSettings()
@@ -353,6 +359,9 @@ final class AppState: ObservableObject {
 
     func setTrim(_ v: Float) { mutateGlobal { $0.trimDB = min(max(v, -12), 12) } }
     func setPreamp(_ v: Float) { mutateGlobal { $0.preampDB = min(max(v, -18), 18) } }
+    func setHearingCeiling(_ v: Float) {
+        mutateGlobal { $0.hearingCeilingDB = min(max(v, -12), -3) }
+    }
     func setFlag(_ key: WritableKeyPath<EQSettings, Bool>, _ value: Bool) {
         mutateGlobal { $0[keyPath: key] = value }
     }
@@ -476,7 +485,7 @@ final class AppState: ObservableObject {
         currentUID.isEmpty ? "customSlot.local" : "customSlot.\(currentUID)"
     }
 
-    private func persistSettings() {
+    private func persistSettings(forceDeviceSave: Bool = false) {
         guard !persistPaused, !suspendPersist else { return }
         let defaults = UserDefaults.standard
         let state = PersistedState(settings: settings, profile: profile, customSlot: customSlot)
@@ -486,6 +495,138 @@ final class AppState: ObservableObject {
             defaults.removeObject(forKey: settingsKey)
             defaults.removeObject(forKey: profileKey)
             defaults.removeObject(forKey: customSlotKey)
+            touchKnownDevice(saved: true, force: forceDeviceSave)
+        }
+    }
+
+    // MARK: - 已知设备配置
+
+    private static let knownDevicesKey = "knownDevices.v1"
+    private static let deviceStatePrefix = "state.v2."
+
+    /// 管理面板看到的列表。配置本体仍按设备 UID 分开保存，切换设备时自动载入。
+    func saveCurrentDeviceConfiguration() {
+        persistSettings(forceDeviceSave: true)
+        deviceConfigNotice = "当前设备配置已保存"
+    }
+
+    func deviceConfigSummary(for device: KnownDeviceProfile) -> String {
+        guard let data = UserDefaults.standard.data(forKey: Self.stateKey(for: device.uid)),
+              let st = try? JSONDecoder().decode(PersistedState.self, from: data) else {
+            return "暂无保存的配置"
+        }
+        var parts = [st.profile.isCustom ? "DIY" : st.profile.title]
+        parts.append("\(st.settings.bands.count) 点 · \(st.settings.bandLayout.title)")
+        if st.settings.bass.mode != .off { parts.append(st.settings.bass.mode.title) }
+        if st.settings.hearingGuard {
+            parts.append(String(format: "护耳 %.0f dBFS", st.settings.hearingCeilingDB))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// 把另一台已知设备的配置复制到当前输出设备。源设备配置不会被删除。
+    func applyDeviceConfiguration(from device: KnownDeviceProfile) {
+        if device.uid == currentUID {
+            loadSettingsForCurrentDevice()
+            deviceConfigNotice = "已重新载入当前设备配置"
+            return
+        }
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: Self.stateKey(for: device.uid)),
+              let st = try? JSONDecoder().decode(PersistedState.self, from: data) else {
+            deviceConfigNotice = "没有找到可载入的配置"
+            return
+        }
+        let resolved = AppState.resolve(settings: st.settings, profile: st.profile, slot: st.customSlot)
+        withBatchedPersist {
+            settings = resolved.settings
+            profile = resolved.profile
+            customSlot = resolved.slot
+        }
+        selectedBandID = resolved.settings.bands.first?.id
+        persistSettings(forceDeviceSave: true)
+        deviceConfigNotice = "已将「\(device.name)」配置复制到当前设备"
+    }
+
+    func deleteDeviceConfiguration(_ device: KnownDeviceProfile) {
+        guard device.uid != currentUID, !device.uid.isEmpty else { return }
+        UserDefaults.standard.removeObject(forKey: Self.stateKey(for: device.uid))
+        knownDevices.removeAll { $0.uid == device.uid }
+        saveKnownDeviceRegistry()
+        deviceConfigNotice = "已删除「\(device.name)」的保存配置"
+    }
+
+    private static func stateKey(for uid: String) -> String {
+        uid.isEmpty ? "state.v2.local" : "state.v2.\(uid)"
+    }
+
+    private static func fallbackDeviceName(for uid: String) -> String {
+        if uid.contains("BuiltInSpeaker") { return "内置扬声器" }
+        if uid.contains("BuiltInHeadphone") { return "内置耳机" }
+        if uid.contains("ExternalHeadphone") { return "外置耳机" }
+        let parts = uid.split(separator: ":")
+        if parts.count >= 3 { return String(parts[2]) }
+        return uid.isEmpty ? "未知设备" : uid
+    }
+
+    private func loadKnownDeviceRegistry() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: Self.knownDevicesKey),
+           let records = try? JSONDecoder().decode([KnownDeviceProfile].self, from: data) {
+            knownDevices = records
+        } else {
+            knownDevices = []
+        }
+
+        // 旧版本已经按设备 UID 保存了 state.v2，但没有列表。这里补一次索引。
+        let storedUIDs = defaults.dictionaryRepresentation().keys.compactMap { key -> String? in
+            guard key.hasPrefix(Self.deviceStatePrefix) else { return nil }
+            let uid = String(key.dropFirst(Self.deviceStatePrefix.count))
+            return uid.isEmpty ? nil : uid
+        }
+        let existing = Set(knownDevices.map(\.uid))
+        let now = Date()
+        for uid in storedUIDs where !existing.contains(uid) {
+            knownDevices.append(KnownDeviceProfile(uid: uid,
+                                                   name: Self.fallbackDeviceName(for: uid),
+                                                   lastUsedAt: now,
+                                                   lastSavedAt: now))
+        }
+        touchKnownDevice(saved: true, force: true)
+    }
+
+    private func touchKnownDevice(saved: Bool, force: Bool = false) {
+        guard !currentUID.isEmpty else { return }
+        let now = Date()
+        let actualName = TapEngine.name(of: TapEngine.defaultOutputDevice())
+        let name = actualName.isEmpty ? Self.fallbackDeviceName(for: currentUID) : actualName
+        if let index = knownDevices.firstIndex(where: { $0.uid == currentUID }) {
+            var record = knownDevices[index]
+            let nameChanged = record.name != name
+            let stale = force || now.timeIntervalSince(record.lastSavedAt) >= 2
+            if nameChanged || stale {
+                record.name = name
+                record.lastUsedAt = now
+                if saved { record.lastSavedAt = now }
+                knownDevices[index] = record
+                saveKnownDeviceRegistry()
+            }
+        } else {
+            knownDevices.append(KnownDeviceProfile(uid: currentUID, name: name,
+                                                  lastUsedAt: now,
+                                                  lastSavedAt: saved ? now : .distantPast))
+            saveKnownDeviceRegistry()
+        }
+    }
+
+    private func saveKnownDeviceRegistry() {
+        knownDevices.sort {
+            if $0.uid == currentUID { return true }
+            if $1.uid == currentUID { return false }
+            return $0.lastSavedAt > $1.lastSavedAt
+        }
+        if let data = try? JSONEncoder().encode(knownDevices) {
+            UserDefaults.standard.set(data, forKey: Self.knownDevicesKey)
         }
     }
 

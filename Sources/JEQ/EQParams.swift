@@ -70,6 +70,10 @@ struct EQSettings: Codable, Equatable {
     var autoPreamp: Bool = true
     var trimDB: Float = 0
     var limiter: Bool = true
+    /// 大音量护耳：开启后由独立的峰值限制器把输出控制在上限以内。
+    /// 默认关闭，避免改变现有音色和响度。
+    var hearingGuard: Bool = false
+    var hearingCeilingDB: Float = -6
 
     init() {
         bands = [
@@ -86,7 +90,7 @@ struct EQSettings: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case bands, bandLayout, bass, clarityDB
-        case preampDB, autoPreamp, trimDB, limiter
+        case preampDB, autoPreamp, trimDB, limiter, hearingGuard, hearingCeilingDB
         // 旧版（固定 4 段参数 EQ）存档
         case subDB, bassDB, midDB, airDB
     }
@@ -97,11 +101,15 @@ struct EQSettings: Codable, Equatable {
         autoPreamp = try c.decodeIfPresent(Bool.self, forKey: .autoPreamp) ?? true
         trimDB = try c.decodeIfPresent(Float.self, forKey: .trimDB) ?? 0
         limiter = try c.decodeIfPresent(Bool.self, forKey: .limiter) ?? true
+        hearingGuard = try c.decodeIfPresent(Bool.self, forKey: .hearingGuard) ?? false
+        hearingCeilingDB = try c.decodeIfPresent(Float.self, forKey: .hearingCeilingDB) ?? -6
         bandLayout = try c.decodeIfPresent(BandLayout.self, forKey: .bandLayout) ?? .freeform
         bass = try c.decodeIfPresent(BassSettings.self, forKey: .bass) ?? .init()
         clarityDB = try c.decodeIfPresent(Float.self, forKey: .clarityDB) ?? 0
         if !preampDB.isFinite { preampDB = 0 }
         if !trimDB.isFinite { trimDB = 0 }
+        if !hearingCeilingDB.isFinite { hearingCeilingDB = -6 }
+        hearingCeilingDB = min(max(hearingCeilingDB, -12), -3)
         if !clarityDB.isFinite { clarityDB = 0 }
         clarityDB = min(max(clarityDB, -6), 6)
 
@@ -133,6 +141,8 @@ struct EQSettings: Codable, Equatable {
         try c.encode(autoPreamp, forKey: .autoPreamp)
         try c.encode(trimDB, forKey: .trimDB)
         try c.encode(limiter, forKey: .limiter)
+        try c.encode(hearingGuard, forKey: .hearingGuard)
+        try c.encode(hearingCeilingDB, forKey: .hearingCeilingDB)
     }
 
     /// 曲线本身（不含手动 preamp/trim）。启用点按频率排序，相邻点之间用
@@ -736,6 +746,7 @@ enum DSPLimits {
     static let limiterKnee: Float = 0.975
     static let limiterCeiling: Float = 0.999
     static let outputWarnLevel: Float = 0.99
+    static let hearingCeilingOptions: [Float] = [-3, -6, -9, -12]
 
     @inline(__always)
     static func softLimit(_ y: Float) -> Float {
@@ -748,6 +759,27 @@ enum DSPLimits {
                 * tanh((-y - limiterKnee) / (limiterCeiling - limiterKnee))
         }
         return y
+    }
+}
+
+/// 大音量护耳使用的立体声联动峰值包络。
+/// 攻击瞬时完成，保证当前采样不越过上限；释放很慢，只恢复峰值余量，
+/// 不做逐歌曲/逐片段响度归一化。
+struct HearingGuardEnvelope {
+    private(set) var gain: Float = 1
+
+    mutating func reset() { gain = 1 }
+
+    @inline(__always)
+    mutating func process(peak: Float, ceiling: Float, releaseCoefficient: Float) -> Float {
+        let safePeak = max(abs(peak), 1e-9)
+        let target = min(1, max(ceiling, 0.001) / safePeak)
+        if target < gain {
+            gain = target
+        } else {
+            gain += (target - gain) * min(max(releaseCoefficient, 0), 1)
+        }
+        return gain
     }
 }
 
@@ -765,6 +797,8 @@ final class ParamStore {
     private var preamp: Float = 1
     private var makeup: Float = 1
     private var limiter: Bool = true
+    private var hearingGuard: Bool = false
+    private var hearingCeiling: Float = 0.501187
     private var lastSampleRate: Float = 0
 
     private var resetRequested = false
@@ -773,6 +807,8 @@ final class ParamStore {
     private(set) var snapPreamp: Float = 1
     private(set) var snapMakeup: Float = 1
     private(set) var snapLimiter: Bool = true
+    private(set) var snapHearingGuard: Bool = false
+    private(set) var snapHearingCeiling: Float = 0.501187
     private(set) var snapReset: Bool = false
 
     init() {
@@ -804,6 +840,8 @@ final class ParamStore {
         preamp = pre
         makeup = make
         limiter = settings.limiter
+        hearingGuard = settings.hearingGuard
+        hearingCeiling = pow(10, settings.hearingCeilingDB / 20)
         if sampleRate != lastSampleRate {
             lastSampleRate = sampleRate
             resetRequested = true
@@ -818,6 +856,8 @@ final class ParamStore {
             snapPreamp = preamp
             snapMakeup = makeup
             snapLimiter = limiter
+            snapHearingGuard = hearingGuard
+            snapHearingCeiling = hearingCeiling
             for i in 0..<ParamStore.maxBands { snapPtr[i] = coeffsPtr[i] }
             snapReset = resetRequested
             resetRequested = false
