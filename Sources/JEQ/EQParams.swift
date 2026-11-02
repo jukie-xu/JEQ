@@ -76,16 +76,8 @@ struct EQSettings: Codable, Equatable {
     var hearingCeilingDB: Float = -6
 
     init() {
-        bands = [
-            Band(freq: 20, gainDB: 0),
-            Band(freq: 40, gainDB: 0),
-            Band(freq: 70, gainDB: 0),
-            Band(freq: 110, gainDB: 0),
-            Band(freq: 200, gainDB: 0),
-            Band(freq: 600, gainDB: 0),
-            Band(freq: 2_400, gainDB: 0),
-            Band(freq: 9_000, gainDB: 0),
-        ]
+        bands = Self.standardFrequencies.map { Band(freq: $0, gainDB: 0) }
+        bandLayout = .standard10
     }
 
     enum CodingKeys: String, CodingKey {

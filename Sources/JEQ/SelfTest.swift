@@ -307,6 +307,14 @@ enum SelfTest {
             return bestF
         }
 
+        let productDefaults = EQSettings()
+        check(productDefaults.bandLayout == .standard10
+              && productDefaults.bands.count == 10
+              && zip(productDefaults.bands, EQSettings.standardFrequencies).allSatisfy {
+                  abs($0.freq - $1) < 0.01
+              },
+              "产品默认使用标准 10 段")
+
         for scene in ScenePreset.allCases {
             var s = EQSettings()
             scene.apply(to: &s)

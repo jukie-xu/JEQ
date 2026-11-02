@@ -63,7 +63,6 @@ struct GainSlider: View {
 
 struct BandSlider: View {
     var title: String
-    var subtitle: String
     @Binding var value: Float
     var tint: Color
     var range: ClosedRange<Float> = -12...12
@@ -73,7 +72,6 @@ struct BandSlider: View {
         VStack(spacing: 2) {
             HStack(spacing: 6) {
                 Text(title).font(.system(size: 11, weight: .medium))
-                Text(subtitle).font(.system(size: 9)).foregroundStyle(.secondary)
                 Spacer()
                 Text(String(format: "%+.1f dB", value))
                     .font(mono(10))
@@ -87,16 +85,10 @@ struct BandSlider: View {
 
 struct ToggleRow: View {
     var title: String
-    var hint: String
     @Binding var isOn: Bool
 
     var body: some View {
-        Toggle(isOn: $isOn) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text(title).font(.system(size: 11))
-                Text(hint).font(.system(size: 9)).foregroundStyle(.secondary)
-            }
-        }
+        Toggle(title, isOn: $isOn)
         .toggleStyle(.switch)
         .controlSize(.mini)
     }
@@ -180,7 +172,6 @@ private struct MeterRow: View {
     var left: MeterChannelSample
     var right: MeterChannelSample
     var clipped: Bool
-    var clipHint: String
 
     var body: some View {
         HStack(spacing: 6) {
@@ -200,7 +191,6 @@ private struct MeterRow: View {
                 .fill(clipped ? Color.red : Color.gray.opacity(0.16))
                 .frame(width: 6, height: 6)
                 .overlay(Circle().strokeBorder(Color.gray.opacity(clipped ? 0 : 0.3), lineWidth: 0.5))
-                .help(clipHint)
         }
         .frame(height: 13)
     }
@@ -252,13 +242,12 @@ struct LevelMeter: View {
             let m = state.pollMeters()
             VStack(spacing: 2) {
                 MeterRow(label: "IN", left: m.inputL, right: m.inputR,
-                         clipped: m.inputClip, clipHint: "输入削波（≥ 0 dBFS）")
+                         clipped: m.inputClip)
                 MeterRow(label: "OUT", left: m.outputL, right: m.outputR,
-                         clipped: m.outputClip, clipHint: "护耳/限幅器介入或输出接近上限")
+                         clipped: m.outputClip)
                 MeterScale()
             }
         }
-        .help("亮条＝峰值，白线＝RMS，细线＝峰值保持；每行上条＝左声道、下条＝右声道；右侧圆点：IN 削波 / OUT 护耳或限幅介入")
     }
 }
 
@@ -399,7 +388,6 @@ struct PanelView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .help("查看已知设备与保存配置")
                     .popover(isPresented: Binding(
                         get: { state.showDeviceProfiles },
                         set: { state.showDeviceProfiles = $0 }
@@ -419,7 +407,6 @@ struct PanelView: View {
                                        : Color.gray.opacity(0.12))
                     )
                     .foregroundStyle(state.profile.isCustom ? Color.orange : Color.secondary)
-                    .help(state.profile.title)
             }
             LevelMeter(state: state)
         }
@@ -453,7 +440,6 @@ struct PanelView: View {
         VStack(spacing: 5) {
             HStack(spacing: 6) {
                 Text("场景模式").font(.system(size: 10, weight: .semibold))
-                Text("标准 10 段 · 独立低音").font(.system(size: 8.5)).foregroundStyle(.tertiary)
                 Spacer()
             }
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
@@ -469,7 +455,6 @@ struct PanelView: View {
         VStack(spacing: 5) {
             HStack(spacing: 6) {
                 Text("经典预设").font(.system(size: 10, weight: .semibold))
-                Text("原版音色").font(.system(size: 8.5)).foregroundStyle(.tertiary)
                 Spacer()
             }
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
@@ -480,33 +465,19 @@ struct PanelView: View {
         }
     }
 
-    private var diySubtitle: String {
-        guard let slot = state.customSlot else { return "改参数自动保存" }
-        if let scene = slot.sceneBase { return "基于 \(scene.title)" }
-        if let base = slot.base { return "基于 \(base.title)" }
-        return "自定义音色"
-    }
-
     private var diyCard: some View {
         let active = state.profile.isCustom
         let available = state.customSlot != nil
         return Button {
             state.applyCustomSlot()
         } label: {
-            VStack(spacing: 0) {
-                HStack(spacing: 4) {
-                    Image(systemName: active ? "tray.full.fill" : "tray.full")
-                        .font(.system(size: 8.5))
-                    Text("DIY").font(.system(size: 10, weight: .semibold))
-                }
-                Text(diySubtitle)
-                    .font(.system(size: 7.5))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                    .opacity(0.72)
+            HStack(spacing: 4) {
+                Image(systemName: active ? "tray.full.fill" : "tray.full")
+                    .font(.system(size: 8.5))
+                Text("DIY").font(.system(size: 10, weight: .semibold))
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 4)
+            .padding(.vertical, 5)
             .background(
                 RoundedRectangle(cornerRadius: 6)
                     .fill(active ? Color.orange.opacity(0.9) : Color.gray.opacity(0.12))
@@ -530,9 +501,6 @@ struct PanelView: View {
                 Button("删除 DIY") { state.deleteCustomSlot() }
             }
         }
-        .help(available
-              ? "点击载入 DIY；右键可回到基础预设、覆盖或删除"
-              : "修改任意频段、低音或清晰度时，会自动保存成 DIY 卡片")
     }
 
     private func sceneButton(_ scene: ScenePreset) -> some View {
@@ -556,21 +524,13 @@ struct PanelView: View {
                 .foregroundStyle(active ? .white : .primary)
         }
         .buttonStyle(.plain)
-        .help(scene.summary)
     }
 
     // MARK: 独立低音模块
 
     private var bassModule: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Text("低音模块").font(.system(size: 10, weight: .semibold))
-                Text("低频单独处理").font(.system(size: 8.5)).foregroundStyle(.tertiary)
-                Spacer()
-                Text(state.settings.bass.mode.title)
-                    .font(.system(size: 8.5, weight: .medium))
-                    .foregroundStyle(state.settings.bass.mode == .off ? .secondary : Color.orange)
-            }
+            Text("低音模块").font(.system(size: 10, weight: .semibold))
 
             HStack(spacing: 4) {
                 ForEach(BassMode.allCases) { mode in
@@ -640,7 +600,6 @@ struct PanelView: View {
                 .foregroundStyle(active ? .white : .primary)
         }
         .buttonStyle(.plain)
-        .help(mode.summary)
     }
 
     private func presetButton(_ p: Preset) -> some View {
@@ -668,32 +627,21 @@ struct PanelView: View {
                 .foregroundStyle(active ? .white : .primary)
         }
         .buttonStyle(.plain)
-        .help(p.summary)
     }
 
     // MARK: 可编辑曲线
 
     private var editor: some View {
-        VStack(spacing: 3) {
-            Group {
-                if snapshotMode {
-                    CurvePreview(state: state)
-                } else {
-                    CurveEditor(state: state,
-                                settings: state.settings,
-                                selectedBandID: state.selectedBandID)
-                }
+        Group {
+            if snapshotMode {
+                CurvePreview(state: state)
+            } else {
+                CurveEditor(state: state,
+                            settings: state.settings,
+                            selectedBandID: state.selectedBandID)
             }
-            .frame(height: 210)
-            Text(state.settings.bandLayout == .standard10
-                 ? "上下拖动频点＝调整该频段的效果增益；频点位置固定，不再整体拖动"
-                 : "双击空白＝加节点 · 拖节点＝单点 · 拖曲线＝整体移动（⌥ 横向移频）")
-                .font(.system(size: 8.5))
-                .foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
         }
+        .frame(height: 210)
     }
 
     // MARK: 启用 / 更多
@@ -709,7 +657,6 @@ struct PanelView: View {
             ))
             .toggleStyle(.switch)
             .controlSize(.mini)
-            .help("自动限制大音量峰值；只压过大的瞬态，不做逐歌音量归一化")
             Spacer()
             Text("\(state.settings.bands.count) 个点")
                 .font(.system(size: 9))
@@ -724,7 +671,7 @@ struct PanelView: View {
 
     private var advanced: some View {
         VStack(alignment: .leading, spacing: 8) {
-            BandSlider(title: "清晰度", subtitle: "独立 2–6 kHz 模块",
+            BandSlider(title: "清晰度",
                        value: Binding(get: { state.settings.clarityDB },
                                       set: { state.setClarity($0) }),
                        tint: .orange, range: -6...6, step: 0.5)
@@ -741,7 +688,6 @@ struct PanelView: View {
                      : "未启用")
                     .font(mono(9.5, .medium))
                     .foregroundStyle(state.settings.autoPreamp ? Color.green : Color.secondary)
-                    .help("按当前最终曲线的最大正增益一次性计算；只随模式/曲线变化，绝不随歌曲电平起伏")
             }
 
             if state.settings.hearingGuard {
@@ -751,9 +697,6 @@ struct PanelView: View {
                         .foregroundStyle(Color.orange)
                     Text("最高输出")
                         .font(.system(size: 10, weight: .medium))
-                    Text("护耳峰值上限")
-                        .font(.system(size: 8.5))
-                        .foregroundStyle(.tertiary)
                     Spacer()
                     Picker("护耳最高输出", selection: Binding(
                         get: { state.settings.hearingCeilingDB },
@@ -769,42 +712,30 @@ struct PanelView: View {
                     .frame(width: 94)
                 }
                 .transition(.opacity)
-                .help("超过该峰值的音量会被自动压低；较低数值保护更强")
             }
 
-            HStack(spacing: 8) {
-                Spacer()
-
-                if state.settings.bandLayout == .freeform {
+            if state.settings.bandLayout == .freeform {
+                HStack {
+                    Spacer()
                     Button("对齐到标准 10 段") { state.alignToStandardBands() }
                         .buttonStyle(.link)
                         .font(.system(size: 9.5))
-                        .help("保留当前曲线形状，重采样到 31.5 Hz–16 kHz 的标准中心频率")
-                } else {
-                    Text("标准 10 段 · 31.5 Hz–16 kHz")
-                        .font(.system(size: 8.5))
-                        .foregroundStyle(.tertiary)
                 }
             }
 
-            BandSlider(title: "响度微调", subtitle: "只改输出音量，不改频响",
+            BandSlider(title: "响度微调",
                        value: Binding(get: { state.settings.trimDB },
                                       set: { state.setTrim($0) }),
                        tint: .teal)
 
             ToggleRow(title: "固定防爆音余量",
-                      hint: "按最终曲线峰值固定预衰减，不随歌曲/电平变化",
                       isOn: Binding(get: { state.settings.autoPreamp },
                                     set: { state.setFlag(\.autoPreamp, $0) }))
             ToggleRow(title: "末级软限幅",
-                      hint: "只处理极端瞬态；超过约 −0.22 dBFS 才介入",
                       isOn: Binding(get: { state.settings.limiter },
                                     set: { state.setFlag(\.limiter, $0) }))
 
             ToggleRow(title: "开机启动",
-                      hint: state.launchAtLogin
-                            ? "登录时自动运行（\(LaunchAtLogin.mechanismDescription)）"
-                            : "登录 macOS 后自动启动 JEQ",
                       isOn: Binding(get: { state.launchAtLogin },
                                     set: { state.setLaunchAtLogin($0) }))
             if let e = state.launchAtLoginError {

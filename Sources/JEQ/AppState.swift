@@ -86,7 +86,7 @@ final class AppState: ObservableObject {
                 loadedSettings = s
             } else {
                 var s = EQSettings()
-                Preset.bassBoost.apply(to: &s)
+                ScenePreset.music.apply(to: &s)
                 loadedSettings = s
             }
 
@@ -660,7 +660,7 @@ final class AppState: ObservableObject {
             loadedSettings = s
         } else {
             var s = EQSettings()
-            Preset.bassBoost.apply(to: &s)
+            ScenePreset.music.apply(to: &s)
             loadedSettings = s
         }
 

@@ -24,9 +24,6 @@ struct DeviceProfilesView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("已知设备配置")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("每台输出设备独立保存 EQ、低音模块与护耳设置")
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button {
@@ -47,9 +44,6 @@ struct DeviceProfilesView: View {
                         .foregroundStyle(.tertiary)
                     Text("还没有保存的设备配置")
                         .font(.system(size: 11, weight: .medium))
-                    Text("连接输出设备后，当前音色会自动保存到该设备。")
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if snapshotMode {
@@ -75,10 +69,6 @@ struct DeviceProfilesView: View {
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                } else {
-                    Text("切换输出设备时，会自动载入对应配置。")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
                 }
                 Spacer()
                 Button("完成") { state.showDeviceProfiles = false }
@@ -132,7 +122,6 @@ struct DeviceProfilesView: View {
                 Button("载入") { state.applyDeviceConfiguration(from: device) }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("把这台设备的配置复制到当前输出设备；源配置仍保留")
             }
         }
         .padding(9)
