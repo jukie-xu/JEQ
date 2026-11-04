@@ -65,6 +65,9 @@ struct EQSettings: Codable, Equatable {
     var bass: BassSettings = .init()
     /// 独立的 2–6 kHz 清晰度模块；0 表示关闭。
     var clarityDB: Float = 0
+    var effectStrength: Float = 1
+    var instruments = InstrumentModules()
+    var moduleOrder: [ToneModule] = []
 
     var preampDB: Float = 0
     var autoPreamp: Bool = true
@@ -85,7 +88,7 @@ struct EQSettings: Codable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case bands, bandLayout, bass, clarityDB
+        case bands, bandLayout, bass, clarityDB, effectStrength, instruments, moduleOrder
         case preampDB, autoPreamp, trimDB, limiter
         // 旧版（固定 4 段参数 EQ）存档
         case subDB, bassDB, midDB, airDB
@@ -99,11 +102,15 @@ struct EQSettings: Codable, Equatable {
         limiter = try c.decodeIfPresent(Bool.self, forKey: .limiter) ?? true
         bandLayout = try c.decodeIfPresent(BandLayout.self, forKey: .bandLayout) ?? .freeform
         bass = try c.decodeIfPresent(BassSettings.self, forKey: .bass) ?? .init()
+        instruments = try c.decodeIfPresent(InstrumentModules.self, forKey: .instruments) ?? .init()
+        moduleOrder = try c.decodeIfPresent([ToneModule].self, forKey: .moduleOrder) ?? []
         clarityDB = try c.decodeIfPresent(Float.self, forKey: .clarityDB) ?? 0
         if !preampDB.isFinite { preampDB = 0 }
         if !trimDB.isFinite { trimDB = 0 }
         if !clarityDB.isFinite { clarityDB = 0 }
         clarityDB = min(max(clarityDB, -6), 6)
+        let strength = try c.decodeIfPresent(Float.self, forKey: .effectStrength) ?? 1
+        effectStrength = strength.isFinite ? min(max(strength, 0), 2) : 1
 
         if let decoded = try c.decodeIfPresent([Band].self, forKey: .bands) {
             bands = decoded
@@ -129,6 +136,9 @@ struct EQSettings: Codable, Equatable {
         try c.encode(bandLayout, forKey: .bandLayout)
         try c.encode(bass, forKey: .bass)
         try c.encode(clarityDB, forKey: .clarityDB)
+        try c.encode(effectStrength, forKey: .effectStrength)
+        try c.encode(instruments, forKey: .instruments)
+        try c.encode(moduleOrder, forKey: .moduleOrder)
         try c.encode(preampDB, forKey: .preampDB)
         try c.encode(autoPreamp, forKey: .autoPreamp)
         try c.encode(trimDB, forKey: .trimDB)
@@ -158,10 +168,20 @@ struct EQSettings: Codable, Equatable {
 
     /// 最终目标曲线 = 固定 EQ + 独立低音模块 + 清晰度模块。
     func effectiveCurveDB(at freq: Float) -> Float {
-        eqCurveDB(at: freq) + bass.curveDB(at: freq) + clarityCurveDB(at: freq)
+        (eqCurveDB(at: freq) + lockedModulesDB(at: freq)) * effectStrength
     }
 
-    private func clarityCurveDB(at freq: Float) -> Float {
+    /// 画布上的节点表示叠加音效后的目标值；写回时扣除独立模块，避免重复叠加。
+    func displayedGainDB(for band: Band) -> Float {
+        effectiveCurveDB(at: band.freq)
+    }
+
+    func bandGainDB(forDisplayedGain gain: Float, at freq: Float) -> Float {
+        min(max(gain / max(effectStrength, 0.01) - lockedModulesDB(at: freq),
+                Self.gainRange.lowerBound), Self.gainRange.upperBound)
+    }
+
+    func clarityCurveDB(at freq: Float) -> Float {
         guard abs(clarityDB) > 0.01 else { return 0 }
         return SmoothCurve.value(at: freq, points: [
             (20, 0), (800, 0), (1_600, clarityDB * 0.22),
@@ -169,6 +189,17 @@ struct EQSettings: Codable, Equatable {
             (6_000, clarityDB * 0.68), (10_000, clarityDB * 0.12),
             (20_000, 0)
         ])
+    }
+
+    var displayDBRange: ClosedRange<Float> {
+        var lo: Float = -18, hi: Float = 18
+        for i in 0...128 {
+            let f = 20 * pow(Float(1000), Float(i) / 128)
+            let value = effectiveCurveDB(at: f)
+            lo = min(lo, floor((value - 1) / 6) * 6)
+            hi = max(hi, ceil((value + 1) / 6) * 6)
+        }
+        return lo...hi
     }
 
     /// 含手动 preamp / trim 的总响应（用于自测；界面曲线不画增益常数）
@@ -473,6 +504,9 @@ enum ScenePreset: String, CaseIterable, Identifiable, Hashable, Codable {
     }
 
     func apply(to s: inout EQSettings) {
+        s.effectStrength = 1
+        s.instruments = InstrumentModules()
+        s.moduleOrder = []
         s.bands = bands
         s.bandLayout = .standard10
         s.bass = defaultBass
@@ -536,6 +570,9 @@ enum Preset: String, CaseIterable, Identifiable, Hashable, Codable {
     }
 
     func apply(to s: inout EQSettings) {
+        s.effectStrength = 1
+        s.instruments = InstrumentModules()
+        s.moduleOrder = []
         s.bands = bands
         s.bandLayout = .freeform
         s.bass = BassSettings()
@@ -551,6 +588,9 @@ struct CustomSlot: Codable, Equatable {
     var sceneBase: ScenePreset? = nil
     var bass: BassSettings? = nil
     var clarityDB: Float? = nil
+    var effectStrength: Float? = nil
+    var instruments: InstrumentModules? = nil
+    var moduleOrder: [ToneModule]? = nil
     var bandLayout: BandLayout? = nil
 }
 

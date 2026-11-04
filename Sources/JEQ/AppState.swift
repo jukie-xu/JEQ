@@ -9,7 +9,8 @@ final class AppState: ObservableObject {
 
     @Published var enabled: Bool {
         didSet {
-            UserDefaults.standard.set(enabled, forKey: "enabled")
+            guard !suspendPersist else { return }
+            persistSettings()
             enabled ? engine.start() : engine.stop()
         }
     }
@@ -17,7 +18,7 @@ final class AppState: ObservableObject {
     @Published var settings: EQSettings {
         didSet {
             persistSettings()
-            engine.republish()
+            engine.republish(settings)
         }
     }
 
@@ -47,6 +48,9 @@ final class AppState: ObservableObject {
     /// 当前设备 UID 的缓存：拖动曲线时每次改参数都要落盘，
     /// 不能每个事件都去问 CoreAudio。
     private var currentUID: String = ""
+    private var currentDeviceName: String = ""
+    private let deviceProfiles: DeviceProfileStore
+    private var storageError: String?
 
     /// 诊断命令（--liveproof）期间关闭落盘，避免测试参数覆盖用户配置
     var persistPaused = false
@@ -54,63 +58,33 @@ final class AppState: ObservableObject {
     /// 批量修改 settings + profile + customSlot 时只落盘一次
     private var suspendPersist = false
 
-    private var lastDeviceUID: String = ""
     private var deviceListener: AudioObjectPropertyListenerBlock?
 
-    private init() {
-        AppState.migrateLegacyDefaults()
+    init(deviceProfiles: DeviceProfileStore = DeviceProfileStore(),
+         initialDevice: (uid: String, name: String)? = nil, observeDevices: Bool = true) {
+        self.deviceProfiles = deviceProfiles
+        if observeDevices { AppState.migrateLegacyDefaults() }
         let defaults = UserDefaults.standard
         enabled = defaults.bool(forKey: "enabled")
-        currentUID = TapEngine.uid(of: TapEngine.defaultOutputDevice())
+        currentUID = initialDevice?.uid ?? TapEngine.uid(of: TapEngine.defaultOutputDevice())
+        currentDeviceName = initialDevice?.name ?? TapEngine.name(of: TapEngine.defaultOutputDevice())
 
-        let primaryKey = currentUID.isEmpty ? "state.v2.local" : "state.v2.\(currentUID)"
-        var loadedSettings: EQSettings
-        var loadedProfile: ProfileRef? = nil
-        var loadedSlot: CustomSlot? = nil
+        suspendPersist = true
+        var initial = EQSettings()
+        Preset.flat.apply(to: &initial)
+        settings = initial
+        profile = .preset(.flat)
+        customSlot = nil
+        selectedBandID = initial.bands.first?.id
 
-        if let data = defaults.data(forKey: primaryKey),
-           let st = try? JSONDecoder().decode(PersistedState.self, from: data) {
-            loadedSettings = st.settings
-            loadedProfile = st.profile
-            loadedSlot = st.customSlot
-        } else {
-            // 旧版分散存档：settings / profile / customSlot 三个键
-            let deviceSettingsKey = currentUID.isEmpty ? "settings.local" : "settings.\(currentUID)"
-            if let data = defaults.data(forKey: deviceSettingsKey) ?? defaults.data(forKey: "settings"),
-               let s = try? JSONDecoder().decode(EQSettings.self, from: data) {
-                loadedSettings = s
-            } else {
-                var s = EQSettings()
-                Preset.bassBoost.apply(to: &s)
-                loadedSettings = s
-            }
-
-            let deviceProfileKey = currentUID.isEmpty ? "profile.local" : "profile.\(currentUID)"
-            if let data = defaults.data(forKey: deviceProfileKey) ?? defaults.data(forKey: "profile"),
-               let p = try? JSONDecoder().decode(ProfileRef.self, from: data) {
-                loadedProfile = p
-            }
-
-            let deviceSlotKey = currentUID.isEmpty ? "customSlot.local" : "customSlot.\(currentUID)"
-            if let data = defaults.data(forKey: deviceSlotKey),
-               let c = try? JSONDecoder().decode(CustomSlot.self, from: data) {
-                loadedSlot = c
-            }
-        }
-
-        let resolved = AppState.resolve(settings: loadedSettings, profile: loadedProfile, slot: loadedSlot)
-        settings = resolved.settings
-        profile = resolved.profile
-        customSlot = resolved.slot
-        selectedBandID = resolved.settings.bands.first?.id
-
-        // 把（可能是旧格式的）状态统一写成一份 state.v2，完成一次性迁移
-        persistSettings()
+        // 名称文件优先；没有文件时把当前设备的旧 UID 配置迁入。
+        loadSettingsForCurrentDevice(allowGlobalMigration: observeDevices)
+        suspendPersist = false
 
         engine.onStateChange = { [weak self] in
             DispatchQueue.main.async { self?.refreshStatus() }
         }
-        installDeviceListener()
+        if observeDevices { installDeviceListener() }
     }
 
     func bootstrap() {
@@ -182,6 +156,9 @@ final class AppState: ObservableObject {
         s.bandLayout = slot.bandLayout ?? .freeform
         s.bass = slot.bass ?? BassSettings()
         s.clarityDB = min(max(slot.clarityDB ?? 0, -6), 6)
+        s.effectStrength = min(max(slot.effectStrength ?? 1, 0), 2)
+        s.instruments = slot.instruments ?? InstrumentModules()
+        s.moduleOrder = slot.moduleOrder ?? []
         withBatchedPersist {
             settings = s
             profile = .custom(base: slot.base, scene: slot.sceneBase)
@@ -242,6 +219,7 @@ final class AppState: ObservableObject {
 
     func updateBand(_ id: UUID, _ body: (inout Band) -> Void) {
         guard let idx = settings.bands.firstIndex(where: { $0.id == id }) else { return }
+        if settings.effectStrength < 0.01 { setEffectStrength(1) }
         var s = settings
         body(&s.bands[idx])
         var b = s.bands[idx]
@@ -265,6 +243,20 @@ final class AppState: ObservableObject {
 
     /// 一次性替换全部控制点（拖动整条曲线用）。
     /// 与 updateBand 走同一条提交路径：自动写入自定义卡、触发参数重发布。
+    func setInstrument(_ kind: InstrumentKind, preset: Int? = nil, gainDB: Float? = nil) {
+        mutateTonal { s in
+            let old = s.instruments[kind]
+            // 先固定原有顺序，再变更开关/预置；增益微调不抢占别人的锁。
+            s.moduleOrder = s.activeModuleOrder
+            s.instruments[kind] = InstrumentModule(preset: preset ?? old.preset, gainDB: gainDB ?? old.gainDB)
+            s.updateModuleOrder(ToneModule(rawValue: kind.rawValue)!, reclaim: preset != nil && preset != old.preset)
+        }
+    }
+
+    func setEffectStrength(_ value: Float) {
+        mutateTonal { $0.effectStrength = min(max(value, 0), 2) }
+    }
+
     func setBands(_ newBands: [Band]) {
         var s = settings
         s.bands = Array(newBands.prefix(EQSettings.maxBands)).map { b in
@@ -320,11 +312,21 @@ final class AppState: ObservableObject {
     // MARK: - 场景模块
 
     func setBassMode(_ mode: BassMode) {
-        mutateTonal { $0.bass.mode = mode }
+        mutateTonal { s in
+            s.moduleOrder = s.activeModuleOrder
+            let changed = s.bass.mode != mode
+            s.bass.mode = mode
+            s.updateModuleOrder(.bass, reclaim: changed)
+        }
     }
 
     func setBassCenter(_ hz: Float) {
-        mutateTonal { $0.bass.centerHz = hz }
+        mutateTonal { s in
+            s.moduleOrder = s.activeModuleOrder
+            let changed = s.bass.centerHz != hz
+            s.bass.centerHz = hz
+            s.updateModuleOrder(.bass, reclaim: changed)
+        }
     }
 
     func setBassStrength(_ strength: BassStrength) {
@@ -332,7 +334,11 @@ final class AppState: ObservableObject {
     }
 
     func setClarity(_ value: Float) {
-        mutateTonal { $0.clarityDB = min(max(value, -6), 6) }
+        mutateTonal { s in
+            s.moduleOrder = s.activeModuleOrder
+            s.clarityDB = min(max(value, -6), 6)
+            s.updateModuleOrder(.clarity, reclaim: false)
+        }
     }
 
     /// 把当前曲线采样到标准 10 个中心频率，之后只允许纵向调增益。
@@ -393,6 +399,9 @@ final class AppState: ObservableObject {
                    sceneBase: sceneBase,
                    bass: s.bass,
                    clarityDB: s.clarityDB,
+                   effectStrength: s.effectStrength,
+                   instruments: s.instruments,
+                   moduleOrder: s.moduleOrder,
                    bandLayout: s.bandLayout)
     }
 
@@ -415,14 +424,12 @@ final class AppState: ObservableObject {
     }
 
     func refreshStatus() {
-        deviceName = engine.outputDeviceName.isEmpty
-            ? (TapEngine.name(of: TapEngine.defaultOutputDevice()))
-            : engine.outputDeviceName
+        deviceName = currentDeviceName.isEmpty ? "—" : currentDeviceName
         latencyMs = engine.framesPerBuffer > 0 && engine.sampleRate > 0
             ? Double(engine.framesPerBuffer) / Double(engine.sampleRate) * 1000
             : 0
         sampleRateText = engine.sampleRate > 0 ? "\(Int(engine.sampleRate)) Hz" : "—"
-        errorText = engine.lastError
+        errorText = engine.lastError ?? storageError
 
         if engine.isRunning {
             statusLine = "运行中"
@@ -477,59 +484,77 @@ final class AppState: ObservableObject {
     }
 
     private func persistSettings() {
-        guard !persistPaused, !suspendPersist else { return }
-        let defaults = UserDefaults.standard
+        guard !persistPaused, !suspendPersist, !currentUID.isEmpty,
+              !currentDeviceName.isEmpty else { return }
         let state = PersistedState(settings: settings, profile: profile, customSlot: customSlot)
-        if let data = try? JSONEncoder().encode(state) {
-            defaults.set(data, forKey: stateKey)
-            // 已迁移到单份 state.v2，清掉本设备的旧分散存档，避免以后回退时复活旧数据
-            defaults.removeObject(forKey: settingsKey)
-            defaults.removeObject(forKey: profileKey)
-            defaults.removeObject(forKey: customSlotKey)
+        do {
+            try deviceProfiles.save(name: currentDeviceName, state: state, enabled: enabled)
+            storageError = nil
+        } catch {
+            storageError = "设备 EQ 保存失败：\(error.localizedDescription)"
+            errorText = storageError
+            NSLog("%@", storageError!)
         }
     }
 
-    /// 换设备后回填：设备存档 → 旧版全局存档（迁移）→ 默认预设。
-    /// 不会有“这台设备没存过就沿用上一台”的情况。
-    func loadSettingsForCurrentDevice() {
+    /// 文件按名称匹配；只迁移本设备 UID 的旧存档，首次启动才允许迁移旧全局数据。
+    func loadSettingsForCurrentDevice(allowGlobalMigration: Bool = false) {
+        guard !currentUID.isEmpty, !currentDeviceName.isEmpty else { return }
         let defaults = UserDefaults.standard
-
-        var loadedSettings: EQSettings
-        var loadedProfile: ProfileRef? = nil
-        var loadedSlot: CustomSlot? = nil
-
-        if let data = defaults.data(forKey: stateKey),
-           let st = try? JSONDecoder().decode(PersistedState.self, from: data) {
-            loadedSettings = st.settings
-            loadedProfile = st.profile
-            loadedSlot = st.customSlot
-        } else if let data = defaults.data(forKey: settingsKey),
-                  let s = try? JSONDecoder().decode(EQSettings.self, from: data) {
-            loadedSettings = s
-            if let pdata = defaults.data(forKey: profileKey),
-               let p = try? JSONDecoder().decode(ProfileRef.self, from: pdata) {
-                loadedProfile = p
-            }
-            if let cdata = defaults.data(forKey: customSlotKey),
-               let c = try? JSONDecoder().decode(CustomSlot.self, from: cdata) {
-                loadedSlot = c
-            }
-        } else if let data = defaults.data(forKey: "settings"),
-                  let s = try? JSONDecoder().decode(EQSettings.self, from: data) {
-            loadedSettings = s
-        } else {
-            var s = EQSettings()
-            Preset.bassBoost.apply(to: &s)
-            loadedSettings = s
+        let migrateGlobal = allowGlobalMigration && !FileManager.default.fileExists(atPath: deviceProfiles.url.path)
+        var saved: DeviceEQProfile?
+        do {
+            saved = try deviceProfiles.profile(named: currentDeviceName)
+            storageError = nil
+        } catch {
+            storageError = "设备 EQ 读取失败：\(error.localizedDescription)"
+            errorText = storageError
+            NSLog("%@", storageError!)
         }
-
-        let resolved = AppState.resolve(settings: loadedSettings, profile: loadedProfile, slot: loadedSlot)
+        var loaded: PersistedState?
+        if let saved { loaded = saved.state }
+        if loaded == nil, let data = defaults.data(forKey: stateKey) {
+            loaded = try? JSONDecoder().decode(PersistedState.self, from: data)
+        }
+        if loaded == nil,
+           let data = defaults.data(forKey: settingsKey)
+                ?? (migrateGlobal ? defaults.data(forKey: "settings") : nil),
+           let s = try? JSONDecoder().decode(EQSettings.self, from: data) {
+            let p = (defaults.data(forKey: profileKey)
+                ?? (migrateGlobal ? defaults.data(forKey: "profile") : nil))
+                .flatMap { try? JSONDecoder().decode(ProfileRef.self, from: $0) }
+            let c = defaults.data(forKey: customSlotKey)
+                .flatMap { try? JSONDecoder().decode(CustomSlot.self, from: $0) }
+            loaded = PersistedState(settings: s, profile: p ?? AppState.inferProfile(s), customSlot: c)
+        }
+        let hasLegacyState = loaded != nil
+        if loaded == nil {
+            var s = EQSettings()
+            Preset.flat.apply(to: &s)
+            loaded = PersistedState(settings: s, profile: .preset(.flat), customSlot: nil)
+        }
+        let resolved = AppState.resolve(settings: loaded!.settings,
+                                        profile: loaded!.profile, slot: loaded!.customSlot)
         withBatchedPersist {
             settings = resolved.settings
             profile = resolved.profile
             customSlot = resolved.slot
+            enabled = saved?.enabled ?? ((allowGlobalMigration && hasLegacyState) ? enabled : false)
         }
         selectedBandID = resolved.settings.bands.first?.id
+    }
+
+    /// 先保存旧设备，再更换名称和 UID，避免把 A 的参数写入 B 的文件条目。
+    func switchOutputDevice(uid: String, name: String) {
+        guard !uid.isEmpty, !name.isEmpty,
+              uid != currentUID || name != currentDeviceName else { return }
+        persistSettings()
+        engine.stop()
+        currentUID = uid
+        currentDeviceName = name
+        loadSettingsForCurrentDevice()
+        if enabled { engine.start() }
+        refreshStatus()
     }
 
     /// 启动/换设备时把 settings、profile、自定义卡三者对齐：
@@ -537,6 +562,7 @@ final class AppState: ObservableObject {
     private static func resolve(settings: EQSettings, profile: ProfileRef?, slot: CustomSlot?)
         -> (settings: EQSettings, profile: ProfileRef, slot: CustomSlot?) {
         var s = settings
+        s.moduleOrder = s.activeModuleOrder
         let wasCustom = profile?.isCustom ?? false
         var p = profile ?? AppState.inferProfile(s)
         var c = slot
@@ -566,6 +592,9 @@ final class AppState: ObservableObject {
                            sceneBase: scene,
                            bass: s.bass,
                            clarityDB: s.clarityDB,
+                   effectStrength: s.effectStrength,
+                   instruments: s.instruments,
+                   moduleOrder: s.moduleOrder,
                            bandLayout: s.bandLayout)
             if bands.count != s.bands.count { s.bands = bands }
         } else if let existing = c {
@@ -604,7 +633,8 @@ final class AppState: ObservableObject {
 
     static func matches(_ preset: Preset, _ s: EQSettings) -> Bool {
         let pb = preset.bands
-        guard s.bass == BassSettings(), abs(s.clarityDB) < 0.01,
+        guard s.instruments == InstrumentModules(), abs(s.effectStrength - 1) < 0.001,
+              s.bass == BassSettings(), abs(s.clarityDB) < 0.01,
               s.bandLayout == .freeform,
               pb.count == s.bands.count else { return false }
         return zip(pb, s.bands).allSatisfy { (a, b) in
@@ -616,7 +646,8 @@ final class AppState: ObservableObject {
 
     static func matches(_ scene: ScenePreset, _ s: EQSettings) -> Bool {
         let sb = scene.bands
-        guard s.bandLayout == .standard10,
+        guard s.instruments == InstrumentModules(), abs(s.effectStrength - 1) < 0.001,
+              s.bandLayout == .standard10,
               s.bass == scene.defaultBass,
               abs(s.clarityDB - scene.defaultClarityDB) < 0.05,
               sb.count == s.bands.count else { return false }
@@ -687,20 +718,11 @@ final class AppState: ObservableObject {
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
             DispatchQueue.main.async {
-                let uid = TapEngine.uid(of: TapEngine.defaultOutputDevice())
-                guard uid != self.lastDeviceUID else { return }
-                self.lastDeviceUID = uid
-                self.currentUID = uid
-                self.loadSettingsForCurrentDevice()
-                if self.enabled {
-                    self.engine.stop()
-                    self.engine.start()
-                }
-                self.refreshStatus()
+                let device = TapEngine.defaultOutputDevice()
+                self.switchOutputDevice(uid: TapEngine.uid(of: device), name: TapEngine.name(of: device))
             }
         }
         deviceListener = block
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block)
-        lastDeviceUID = TapEngine.uid(of: TapEngine.defaultOutputDevice())
     }
 }

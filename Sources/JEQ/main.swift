@@ -1,6 +1,15 @@
 import Foundation
 
 // 命令行诊断模式优先于 GUI
+if CommandLine.arguments.contains("--locktest") {
+    exit(SelfTest.runLockTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("--instrumenttest") {
+    exit(SelfTest.runInstrumentTest() ? 0 : 1)
+}
+if CommandLine.arguments.contains("--devicetest") {
+    exit(SelfTest.runDeviceTest() ? 0 : 1)
+}
 if CommandLine.arguments.contains("--selftest") {
     SelfTest.runDSP()
     exit(0)

@@ -329,8 +329,8 @@ final class TapEngine {
 
     /// 参数变化时由 UI 调用。deviceVolume 参数已不参与计算，
     /// 不再每次拖动都去查询 HAL。
-    func republish() {
-        params.publish(AppState.shared.settings, sampleRate: sampleRate, deviceVolume: 1)
+    func republish(_ settings: EQSettings) {
+        params.publish(settings, sampleRate: sampleRate, deviceVolume: 1)
     }
 
     // MARK: - 电平表数据

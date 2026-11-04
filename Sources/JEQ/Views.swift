@@ -271,8 +271,9 @@ struct CurvePreview: View {
         Canvas { ctx, size in
             let minF: Float = 20
             let maxF: Float = 20_000
-            let maxDB: Float = 18
-            let minDB: Float = -18
+            let range = state.settings.displayDBRange
+            let maxDB = range.upperBound
+            let minDB = range.lowerBound
 
             func x(_ f: Float) -> CGFloat {
                 CGFloat(log(max(f, minF) / minF) / log(maxF / minF)) * size.width
@@ -328,10 +329,10 @@ struct CurvePreview: View {
 
             for b in state.settings.bands {
                 // 节点直接画在控制点位置，插值曲线按定义经过它
-                let p = CGPoint(x: x(b.freq), y: y(b.gainDB))
+                let p = CGPoint(x: x(b.freq), y: y(state.settings.displayedGainDB(for: b)))
                 let r: CGFloat = 4.8
                 let dot = Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
-                ctx.fill(dot, with: .color(b.enabled ? nodeTint(b.gainDB) : .gray.opacity(0.4)))
+                ctx.fill(dot, with: .color(b.enabled ? nodeTint(state.settings.displayedGainDB(for: b)) : .gray.opacity(0.4)))
                 ctx.stroke(dot, with: .color(.white), lineWidth: 1.4)
 
                 let ly = p.y + 14 > size.height - 4 ? p.y - 10 : p.y + 10
@@ -354,6 +355,16 @@ struct PanelView: View {
     var snapshotMode: Bool = false
 
     var body: some View {
+        Group {
+            if snapshotMode { content }
+            else {
+                ScrollView(.vertical) { content }
+                    .frame(width: 384, height: min(820, (NSScreen.main?.visibleFrame.height ?? 900) - 80))
+            }
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             // 上半区包一层：ViewBuilder 每个 buildBlock 最多 10 个子视图，
             // 这里分组后给后续加控件留余量。
@@ -362,6 +373,7 @@ struct PanelView: View {
                 profilesSection
                 bassModule
                 editor
+                instrumentModules
             }
             Divider().opacity(0.5)
             controlRow
@@ -557,6 +569,9 @@ struct PanelView: View {
             }
 
             if state.settings.bass.mode != .off {
+                Text(state.settings.moduleLockText(.bass))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 7) {
                     Text("中心").font(.system(size: 9)).foregroundStyle(.secondary)
                     Picker("低音中心", selection: Binding(
@@ -600,6 +615,67 @@ struct PanelView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.gray.opacity(0.15), lineWidth: 0.7)
         )
+    }
+
+    private var instrumentModules: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("乐器与人声").font(.system(size: 10, weight: .semibold))
+            Text("先开启的模块锁定频段，关闭后释放；边界平滑过渡")
+                .font(.system(size: 9)).foregroundStyle(.secondary)
+            ForEach(InstrumentKind.allCases) { kind in
+                instrumentModule(kind)
+            }
+        }
+    }
+
+    private func instrumentModule(_ kind: InstrumentKind) -> some View {
+        let module = state.settings.instruments[kind]
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(kind.title).font(.system(size: 10, weight: .semibold))
+                Spacer()
+                if module.preset > 0 {
+                    Text(String(format: "中心 %g Hz", kind.presets[module.preset - 1].centerHz))
+                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 4) {
+                ForEach(0...3, id: \.self) { index in
+                    Button {
+                        state.setInstrument(kind, preset: index)
+                    } label: {
+                        Text(index == 0 ? "关闭" : kind.presets[index - 1].title)
+                            .font(.system(size: 9, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(module.preset == index ? Color.orange.opacity(0.85) : Color(nsColor: .controlBackgroundColor),
+                                        in: RoundedRectangle(cornerRadius: 5))
+                            .foregroundStyle(module.preset == index ? .white : .primary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(kind.title)：\(index == 0 ? "关闭" : kind.presets[index - 1].title)")
+                }
+            }
+            if module.preset > 0 {
+                Text(state.settings.moduleLockText(ToneModule(rawValue: kind.rawValue)!))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Text("增益").font(.system(size: 9)).foregroundStyle(.secondary)
+                    Slider(value: Binding(get: { state.settings.instruments[kind].gainDB },
+                                          set: { state.setInstrument(kind, gainDB: $0) }),
+                           in: -6...6, step: 0.5)
+                        .controlSize(.mini)
+                        .accessibilityLabel("\(kind.title)增益")
+                    Text(String(format: "%+.1f dB", module.gainDB))
+                        .font(.system(size: 9, design: .monospaced))
+                        .frame(width: 54, alignment: .trailing)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.gray.opacity(0.065), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.15), lineWidth: 0.7))
     }
 
     private func bassModeButton(_ mode: BassMode) -> some View {
@@ -664,8 +740,8 @@ struct PanelView: View {
             }
             .frame(height: 210)
             Text(state.settings.bandLayout == .standard10
-                 ? "上下拖动频点＝调整该频段的效果增益；频点位置固定，不再整体拖动"
-                 : "双击空白＝加节点 · 拖节点＝单点 · 拖曲线＝整体移动（⌥ 横向移频）")
+                 ? "拖频点＝调整该频段 · 拖曲线＝上拉加强、下拉减弱 · 圆点含全部音效"
+                 : "双击空白＝加节点 · 拖节点＝单点 · 拖曲线＝调音效强度（⌥ 横向移频）")
                 .font(.system(size: 8.5))
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -682,7 +758,7 @@ struct PanelView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
             Spacer()
-            Text("\(state.settings.bands.count) 个点")
+            Text(String(format: "%d 个点 · 音效 %.0f%%", state.settings.bands.count, state.settings.effectStrength * 100))
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
             Button(state.showAdvanced ? "收起" : "更多") {
@@ -695,10 +771,15 @@ struct PanelView: View {
 
     private var advanced: some View {
         VStack(alignment: .leading, spacing: 8) {
-            BandSlider(title: "清晰度", subtitle: "独立 2–6 kHz 模块",
+            BandSlider(title: "清晰度", subtitle: "独立频段 · 归零关闭并释放",
                        value: Binding(get: { state.settings.clarityDB },
                                       set: { state.setClarity($0) }),
                        tint: .orange, range: -6...6, step: 0.5)
+            if abs(state.settings.clarityDB) > 0.01 {
+                Text(state.settings.moduleLockText(.clarity))
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack(spacing: 6) {
                 Image(systemName: "shield.lefthalf.filled")

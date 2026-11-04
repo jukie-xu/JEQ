@@ -6,6 +6,215 @@ import AppKit
 enum SelfTest {
 
     static let sr: Float = 48_000
+    static func runLockTest() -> Bool {
+        var failures = 0
+        func check(_ ok: Bool, _ label: String) {
+            print("\(ok ? "✓" : "✗") \(label)")
+            if !ok { failures += 1 }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("JEQ-lock-test-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DeviceProfileStore(url: directory.appendingPathComponent("devices.json"))
+        let app = AppState(deviceProfiles: store, initialDevice: ("lock-test-\(UUID())", "锁定测试设备"), observeDevices: false)
+        app.apply(Preset.flat)
+        app.setInstrument(.strings, preset: 1, gainDB: 3)
+        let reference = app.settings.effectiveCurveDB(at: 250)
+        app.setInstrument(.vocals, preset: 1, gainDB: 6)
+        check(app.settings.moduleOwner(at: 250) == .strings,
+              "先开启的弦乐优先拥有 250 Hz")
+        check(abs(app.settings.effectiveCurveDB(at: 250) - reference) < 0.001,
+              "后开启人声不改变弦乐锁定的频段")
+        let positive = app.settings
+        app.setInstrument(.vocals, gainDB: -6)
+        check(abs(app.settings.effectiveCurveDB(at: 250) - reference) < 0.001,
+              "人声从 +6 到 -6 dB 不穿透弦乐锁")
+        check(app.settings.moduleLockText(.vocals).contains("弦乐模块"), "界面明确显示占用模块")
+        app.setInstrument(.strings, preset: 0)
+        check(app.settings.moduleOwner(at: 250) == .vocals
+              && app.settings.effectiveCurveDB(at: 250) < -5.9,
+              "关闭弦乐后释放频段，由已开启人声立即接管")
+        app.setInstrument(.strings, preset: 1, gainDB: 3)
+        check(app.settings.moduleOwner(at: 250) == .vocals, "重新开启弦乐不会抢回人声的锁")
+        app.setInstrument(.vocals, preset: 2)
+        check(app.settings.moduleOwner(at: 250) == .strings,
+              "切换人声预置释放旧频段，并重新申请新范围")
+        let restored = AppState(deviceProfiles: DeviceProfileStore(url: store.url),
+                                initialDevice: ("different-uid-\(UUID())", "锁定测试设备"), observeDevices: false)
+        check(restored.settings.moduleOrder == app.settings.moduleOrder
+              && restored.settings.moduleOwner(at: 250) == .strings,
+              "设备名称存档和重启恢复后保留锁定优先级")
+        app.apply(Preset.flat)
+        app.setBassMode(.natural)
+        app.setInstrument(.drums, preset: 1, gainDB: -6)
+        let bassReference = app.settings.effectiveCurveDB(at: 70)
+        app.setInstrument(.drums, gainDB: 6)
+        check(abs(app.settings.effectiveCurveDB(at: 70) - bassReference) < 0.001,
+              "低音先开启时鼓点不会覆盖其负责频段")
+        app.setBassMode(.off)
+        check(app.settings.moduleOwner(at: 70) == .drums && app.settings.effectiveCurveDB(at: 70) > 5.9,
+              "关闭低音后鼓点接管对应频段")
+        app.setBassMode(.natural)
+        let drumReference = app.settings.effectiveCurveDB(at: 70)
+        app.setBassStrength(.high)
+        check(abs(app.settings.effectiveCurveDB(at: 70) - drumReference) < 0.001,
+              "鼓点先锁定后，低音强度变化不会覆盖鼓点")
+        // DSP 拟合允许小误差；除去全局预衰减后检查实际音频中的锁定频段。
+        func measured(_ s: EQSettings) -> Float {
+            let f: Float = 250
+            let input = sine(f, amp: 0.001, n: 48_000, sr: sr)
+            let output = process(input, settings: s, sr: sr)
+            let a = input.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, f, sr) }
+            let b = output.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, f, sr) }
+            return Float(20 * log10(b / a)) - s.effectivePreampDB
+        }
+        var negative = positive
+        negative.instruments.vocals.gainDB = -6
+        let delta = abs(measured(positive) - measured(negative))
+        check(delta < 0.75, String(format: "实际音频锁定频段差异 %.3f dB（自动预衰减归一后）", delta))
+        // 连续采样检查所有权交界无硬跳变。
+        var previous = negative.effectiveCurveDB(at: 20)
+        var largest: Float = 0
+        for i in 1...10_000 {
+            let f = 20 * pow(Float(1000), Float(i) / 10_000)
+            let now = negative.effectiveCurveDB(at: f)
+            largest = max(largest, abs(now - previous)); previous = now
+        }
+        check(largest < 0.2, String(format: "所有权交界平滑，密集采样最大相邻变化 %.3f dB", largest))
+        print("频段锁定测试：\(failures) 个失败")
+        return failures == 0
+    }
+
+    static func runInstrumentTest() -> Bool {
+        var failures = 0
+        func check(_ ok: Bool, _ name: String) {
+            print("\(ok ? "✓" : "✗") \(name)")
+            if !ok { failures += 1 }
+        }
+        for kind in InstrumentKind.allCases {
+            for index in 1...3 {
+                let preset = kind.presets[index - 1]
+                for gain: Float in [-6, 6] {
+                    var s = EQSettings()
+                    Preset.flat.apply(to: &s)
+                    s.instruments[kind] = InstrumentModule(preset: index, gainDB: gain)
+                    s.limiter = false
+                    let target = s.effectiveCurveDB(at: preset.centerHz) + s.effectivePreampDB
+                    let input = sine(preset.centerHz, amp: 0.001, n: 48_000, sr: sr)
+                    let output = process(input, settings: s, sr: sr)
+                    let a = input.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, preset.centerHz, sr) }
+                    let b = output.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, preset.centerHz, sr) }
+                    let actual = Float(20 * log10(b / a))
+                    check(abs(actual - target) < 1,
+                          "\(kind.title)/\(preset.title) \(gain) dB：音频处理与目标相符")
+                    for band in s.bands {
+                        let displayed = s.displayedGainDB(for: band)
+                        check(abs(s.bandGainDB(forDisplayedGain: displayed, at: band.freq) - band.gainDB) < 0.001,
+                              "\(kind.rawValue) \(band.freq) Hz 节点反算不重复叠加")
+                    }
+                    s.instruments[kind].preset = 0
+                    check(abs(s.effectiveCurveDB(at: preset.centerHz)) < 0.001, "关闭该模块立即移除频响贡献")
+                }
+            }
+        }
+        var stacked = EQSettings()
+        ScenePreset.heavyBass.apply(to: &stacked)
+        for kind in InstrumentKind.allCases {
+            stacked.instruments[kind] = InstrumentModule(preset: 1, gainDB: 6)
+        }
+        stacked.effectStrength = 2
+        let range = stacked.displayDBRange
+        check((0...256).allSatisfy {
+            range.contains(stacked.effectiveCurveDB(at: 20 * pow(Float(1000), Float($0) / 256)))
+        }, "多模块叠加及 200% 强度时绘图范围覆盖整条曲线")
+        let data = try! JSONEncoder().encode(stacked)
+        check((try! JSONDecoder().decode(EQSettings.self, from: data)) == stacked,
+              "四个模块、预置和增益完整持久化")
+        let oldData = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+        var legacy = oldData
+        legacy.removeValue(forKey: "instruments")
+        let decoded = try! JSONDecoder().decode(EQSettings.self, from: JSONSerialization.data(withJSONObject: legacy))
+        check(decoded.instruments == InstrumentModules(), "旧配置缺少新模块时默认全部关闭")
+        let malformed = try! JSONDecoder().decode(InstrumentModule.self,
+                from: Data("{\"preset\":99,\"gainDB\":100}".utf8))
+        check(malformed.preset == 3 && malformed.gainDB == 6, "文件中的越界模块参数被限制到合法范围")
+        Preset.flat.apply(to: &stacked)
+        check(stacked.instruments == InstrumentModules(), "选择出厂预设清除模块叠加，可回到原始音色")
+        print("乐器模块测试：\(failures) 个失败")
+        return failures == 0
+    }
+
+    static func runDeviceTest() -> Bool {
+        var failures = 0
+        func check(_ ok: Bool, _ name: String) {
+            print("\(ok ? "✓" : "✗") \(name)")
+            if !ok { failures += 1 }
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("JEQ-device-test-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("device-profiles.json")
+        let store = DeviceProfileStore(url: url)
+        let uidA = "test-A-\(UUID())"
+        let uidB = "test-B-\(UUID())"
+        let app = AppState(deviceProfiles: store, initialDevice: (uidA, "测试耳机 A"), observeDevices: false)
+        app.apply(.speech)
+        app.setEffectStrength(0.65)
+        app.setInstrument(.vocals, preset: 2, gainDB: -2.5)
+        app.setInstrument(.piano, preset: 3, gainDB: 4)
+        let aSettings = app.settings
+        let aProfile = app.profile
+        let aSlot = app.customSlot
+        app.switchOutputDevice(uid: uidB, name: "测试音箱 B")
+        check(app.profile == .preset(.flat) && app.customSlot == nil && !app.enabled,
+              "首次连接新设备使用独立直通配置，不继承 A")
+        app.apply(Preset.cinema)
+        let bSettings = app.settings
+        app.switchOutputDevice(uid: uidA, name: "测试耳机 A")
+        check(app.settings == aSettings && app.profile == aProfile && app.customSlot == aSlot,
+              "A → B → A 恢复完整参数、选择、强度和自定义卡")
+        app.switchOutputDevice(uid: "new-UID-\(UUID())", name: "测试音箱 B")
+        check(app.settings == bSettings && app.profile == .preset(.cinema) && app.customSlot == nil,
+              "同名设备更换 UID 后恢复 B，且不携带 A 的自定义卡")
+        let relaunched = AppState(deviceProfiles: DeviceProfileStore(url: url),
+                                 initialDevice: (uidA, "测试耳机 A"), observeDevices: false)
+        check(relaunched.settings == aSettings && relaunched.profile == aProfile && relaunched.customSlot == aSlot,
+              "重新创建应用状态，从文件恢复设备 A")
+        do {
+            let fresh = DeviceProfileStore(url: url)
+            check(try fresh.profile(named: "测试耳机 A")?.state.settings == aSettings,
+                  "从新文件实例读回 A，确认参数实际落盘")
+            check(try fresh.profile(named: "测试音箱 B")?.state.settings == bSettings,
+                  "A 与 B 在同一 JSON 内分别保存，互不覆盖")
+            let state = PersistedState(settings: aSettings, profile: aProfile, customSlot: aSlot)
+            try fresh.save(name: "斜线/蓝牙:耳机 🎧", state: state, enabled: true)
+            check(try fresh.profile(named: "斜线/蓝牙:耳机 🎧")?.enabled == true,
+                  "设备名含路径字符和中文时安全存储，启用状态独立持久化")
+            try Data("{broken".utf8).write(to: url)
+            do {
+                try fresh.save(name: "C", state: state, enabled: false)
+                check(false, "损坏文件禁止覆盖")
+            } catch {
+                check(try Data(contentsOf: url) == Data("{broken".utf8), "损坏文件报错并保留原始内容")
+            }
+        } catch {
+            check(false, "文件存储测试异常：\(error)")
+        }
+        // 旧 UID 配置迁移；只操作随机键，测试结束删除。
+        let legacyUID = "migration-test-\(UUID())"
+        let legacyKey = "state.v2.\(legacyUID)"
+        let legacyURL = dir.appendingPathComponent("legacy.json")
+        let legacy = PersistedState(settings: bSettings, profile: .preset(.cinema), customSlot: nil)
+        UserDefaults.standard.set(try! JSONEncoder().encode(legacy), forKey: legacyKey)
+        defer { UserDefaults.standard.removeObject(forKey: legacyKey) }
+        let migrated = AppState(deviceProfiles: DeviceProfileStore(url: legacyURL),
+                                initialDevice: (legacyUID, "旧版耳机"), observeDevices: false)
+        check(migrated.settings == bSettings && migrated.profile == .preset(.cinema),
+              "旧 UID 存档迁移时保留 EQ 和当前选择")
+        check((try? DeviceProfileStore(url: legacyURL).profile(named: "旧版耳机")) != nil,
+              "旧存档自动写入名称配置文件")
+        print("设备存储测试：\(failures) 个失败")
+        return failures == 0
+    }
+
 
     // MARK: - 工具
 
@@ -207,6 +416,109 @@ enum SelfTest {
                     && abs((x.freq / y.freq) - r0) < 1e-4
             }
         }
+
+        // 含独立音效时，节点坐标与拖动写回必须互为逆运算。
+        for mode in BassMode.allCases {
+            for strength in BassStrength.allCases {
+                var combined = EQSettings()
+                ScenePreset.music.apply(to: &combined)
+                combined.bass = BassSettings(mode: mode, centerHz: 80, strength: strength)
+                combined.clarityDB = 3
+                for i in combined.bands.indices {
+                    let b = combined.bands[i]
+                    let target = combined.displayedGainDB(for: b) - 2
+                    combined.bands[i].gainDB = combined.bandGainDB(forDisplayedGain: target, at: b.freq)
+                    check(abs(combined.effectiveCurveDB(at: b.freq) - target) < 0.001,
+                          "\(mode.rawValue)/\(strength.rawValue) \(b.freq) Hz 节点拖动更新最终增益")
+                }
+                let original = combined
+                combined.bands = CurveShift.apply(original.bands, deltaDB: 2, ratio: 1)
+                check(zip(original.bands, combined.bands).allSatisfy {
+                    $0.freq == $1.freq && abs($1.gainDB - $0.gainDB - 2) < 0.001
+                }, "10 段整体拖动更新全部数据并锁定频率")
+                let f: Float = 125
+                combined.autoPreamp = false
+                combined.limiter = false
+                let input = sine(f, amp: 0.01, n: 48_000, sr: sr)
+                let output = process(input, settings: combined, sr: sr)
+                let a = input.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, f, sr) }
+                let b = output.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, f, sr) }
+                let measured = Float(20 * log10(b / a))
+                check(abs(measured - combined.effectiveCurveDB(at: f)) < 1,
+                      "\(mode.rawValue)/\(strength.rawValue) 实际音频增益跟随节点",
+                      String(format: "target %.2f measured %.2f", combined.effectiveCurveDB(at: f), measured))
+            }
+        }
+
+        // 直接驱动原生画布鼠标事件，覆盖标准 10 段曾被布局判断拦截的路径。
+        let uiState = AppState.shared
+        uiState.persistPaused = true
+        var uiSettings = EQSettings()
+        uiSettings.bandLayout = .standard10
+        uiSettings.bands = EQSettings.standardFrequencies.map { Band(freq: $0, gainDB: 0) }
+        uiSettings.bands[0].gainDB = 4
+        uiSettings.bands[9].gainDB = -4
+        uiState.settings = uiSettings
+        let canvas = CurveCanvasView(frame: NSRect(x: 0, y: 0, width: 600, height: 210))
+        canvas.state = uiState
+        func mouse(_ type: NSEvent.EventType, _ x: CGFloat, _ y: CGFloat) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: y),
+                               modifierFlags: [], timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        canvas.mouseDown(with: mouse(.leftMouseDown, 310, 105))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, 310, 157.5))
+        canvas.mouseUp(with: mouse(.leftMouseUp, 310, 157.5))
+        check(abs(uiState.settings.effectStrength - 1.5) < 0.001,
+              "原生拖动曲线：上拖加强至 150%")
+        check(abs(uiState.settings.effectiveCurveDB(at: 31.5) - 6) < 0.001
+              && abs(uiState.settings.effectiveCurveDB(at: 16_000) + 6) < 0.001,
+              "整体加强同时扩大提升与衰减，改变频段比例")
+        check(zip(uiState.settings.bands, uiSettings.bands).allSatisfy { $0.freq == $1.freq },
+              "标准频率保持不变")
+        uiSettings.bass = BassSettings(mode: .natural, centerHz: 80, strength: .high)
+        uiSettings.effectStrength = 1.5
+        uiState.settings = uiSettings
+        let band = uiSettings.bands[2]
+        let px = CGFloat(log(band.freq / 20) / log(Float(1000))) * 600
+        let py = CGFloat((uiSettings.displayedGainDB(for: band) + 18) / 36) * 210
+        canvas.mouseDown(with: mouse(.leftMouseDown, px, py))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, px, py - 17.5))
+        canvas.mouseUp(with: mouse(.leftMouseUp, px, py - 17.5))
+        check(abs(uiState.settings.bands[2].gainDB + 2) < 0.11,
+              "150% 强度下圆点拖动正确反算频段增益")
+
+        var strong = EQSettings()
+        ScenePreset.heavyBass.apply(to: &strong)
+        strong.clarityDB = 2
+        func measuredContrast(_ settings: EQSettings) -> Float {
+            func measured(_ freq: Float) -> Float {
+                let input = sine(freq, amp: 0.001, n: 48_000, sr: sr)
+                let output = process(input, settings: settings, sr: sr)
+                let a = input.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, freq, sr) }
+                let b = output.withUnsafeBufferPointer { goertzelAmp($0.baseAddress! + 24_000, 24_000, freq, sr) }
+                return Float(20 * log10(b / a))
+            }
+            return measured(63) - measured(1_000)
+        }
+        let originalContrast = measuredContrast(strong)
+        strong.effectStrength = 0.5
+        let weakContrast = measuredContrast(strong)
+        strong.effectStrength = 1.5
+        let strongContrast = measuredContrast(strong)
+        print(String(format: "  实测低频/中频差：50%% %.2f / 100%% %.2f / 150%% %.2f dB", weakContrast, originalContrast, strongContrast))
+        check(weakContrast < originalContrast - 2 && strongContrast > originalContrast + 2,
+              "自动预衰减开启时，真实音频低频/中频比例仍随强度改变",
+              String(format: "50%% %.2f / 100%% %.2f / 150%% %.2f dB", weakContrast, originalContrast, strongContrast))
+        strong.effectStrength = 0
+        check(abs(measuredContrast(strong)) < 0.01 && strong.maxBoost == 0,
+              "0% 强度恢复平直音效")
+        let saved = try! JSONEncoder().encode(strong)
+        check((try! JSONDecoder().decode(EQSettings.self, from: saved)).effectStrength == 0,
+              "强度可持久化，包括 0%")
+        strong.effectStrength = 1
+        check(abs(measuredContrast(strong) - originalContrast) < 0.01,
+              "从 0% 恢复 100% 不丢失原始曲线")
 
         // 打击感最大增益 +10 dB，还有 8 dB 余量，适合测“正常平移”
         var s = EQSettings()
@@ -456,6 +768,10 @@ enum SelfTest {
         if CommandLine.arguments.contains("--demo-heavy") {
             state.persistPaused = true
             state.apply(.heavyBass)
+        }
+        if CommandLine.arguments.contains("--demo-modules") {
+            state.persistPaused = true
+            for kind in InstrumentKind.allCases { state.setInstrument(kind, preset: 2, gainDB: 3) }
         }
         // 没有音频输入时电平表全是 0，离屏渲染看不出排版；喂一组固定读数
         state.meterDemoLevels = true

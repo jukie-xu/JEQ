@@ -51,8 +51,8 @@ final class CurveCanvasView: NSView {
 
     private let minF: Float = 20
     private let maxF: Float = 20_000
-    private let maxDB: Float = 18
-    private let minDB: Float = -18
+    private var maxDB: Float = 18
+    private var minDB: Float = -18
 
     private var hoverID: UUID?
     private var draggingID: UUID?
@@ -63,6 +63,7 @@ final class CurveCanvasView: NSView {
     /// 每一帧都从原始值重算，避免多次累加导致曲线变形/漂移。
     private struct CurveDrag {
         var baseline: [Band]
+        var strength: Float
         var start: NSPoint
         var shiftFreq: Bool
     }
@@ -104,6 +105,9 @@ final class CurveCanvasView: NSView {
         super.draw(dirtyRect)
         guard let state else { return }
         let settings = state.settings
+        let range = settings.displayDBRange
+        minDB = range.lowerBound
+        maxDB = range.upperBound
         let rect = bounds
         guard rect.width > 1, rect.height > 1 else { return }
 
@@ -155,7 +159,7 @@ final class CurveCanvasView: NSView {
             drawText(label, at: NSPoint(x: lx, y: 2), font: gridFont,
                      color: NSColor.secondaryLabelColor.withAlphaComponent(0.7))
         }
-        for db in stride(from: Float(-18), through: 18, by: 6) {
+        for db in stride(from: minDB, through: maxDB, by: 6) {
             let path = NSBezierPath()
             path.move(to: NSPoint(x: 0, y: y(for: db, in: rect)))
             path.line(to: NSPoint(x: rect.width, y: y(for: db, in: rect)))
@@ -177,11 +181,12 @@ final class CurveCanvasView: NSView {
         if let drag = curveDrag, !drag.baseline.isEmpty {
             var base = settings
             base.bands = drag.baseline
+            base.effectStrength = drag.strength
             let ghost = NSBezierPath()
             for i in 0...steps {
                 let t = Float(i) / Float(steps)
                 let f = minF * pow(maxF / minF, t)
-                let p = NSPoint(x: CGFloat(t) * rect.width, y: y(for: base.eqCurveDB(at: f), in: rect))
+                let p = NSPoint(x: CGFloat(t) * rect.width, y: y(for: base.effectiveCurveDB(at: f), in: rect))
                 if i == 0 { ghost.move(to: p) } else { ghost.line(to: p) }
             }
             ghost.lineWidth = 1
@@ -213,7 +218,7 @@ final class CurveCanvasView: NSView {
 
         // 节点：y 就是控制点的增益，曲线按定义经过它
         for b in settings.bands {
-            let p = NSPoint(x: x(for: b.freq, in: rect), y: y(for: b.gainDB, in: rect))
+            let p = NSPoint(x: x(for: b.freq, in: rect), y: y(for: settings.displayedGainDB(for: b), in: rect))
             let selected = b.id == state.selectedBandID
             let hover = b.id == hoverID
             let r: CGFloat = (selected || hover) ? 6 : 4.8
@@ -248,7 +253,7 @@ final class CurveCanvasView: NSView {
         var placedLabels: [NSRect] = []
         for b in settings.bands.sorted(by: { $0.freq < $1.freq }) {
             let selected = b.id == state.selectedBandID
-            let np = NSPoint(x: x(for: b.freq, in: rect), y: y(for: b.gainDB, in: rect))
+            let np = NSPoint(x: x(for: b.freq, in: rect), y: y(for: settings.displayedGainDB(for: b), in: rect))
             let text = labelFreq(b.freq)
             let attrs: [NSAttributedString.Key: Any] = [.font: labelFont]
             let size = (text as NSString).size(withAttributes: attrs)
@@ -271,7 +276,7 @@ final class CurveCanvasView: NSView {
 
         // 只有拖动时在右上角显示数值；悬停/选中不再弹气泡，避免挡住操作
         if let id = draggingID, let b = settings.bands.first(where: { $0.id == id }) {
-            var text = String(format: "%@ · %+.1f dB", freqText(b.freq), b.gainDB)
+            var text = String(format: "%@ · %+.1f dB", freqText(b.freq), settings.displayedGainDB(for: b))
             if !b.enabled { text += " · 已禁用" }
             drawHUD(text, in: rect)
         } else if let drag = curveDrag, let first = drag.baseline.first,
@@ -279,7 +284,7 @@ final class CurveCanvasView: NSView {
             if drag.shiftFreq {
                 drawHUD(String(format: "整体移频 ×%.2f", cur.freq / max(first.freq, 0.001)), in: rect)
             } else {
-                drawHUD(String(format: "整体移动 %+.1f dB", cur.gainDB - first.gainDB), in: rect)
+                drawHUD(String(format: "音效强度 %.0f%%", settings.effectStrength * 100), in: rect)
             }
         }
     }
@@ -322,8 +327,8 @@ final class CurveCanvasView: NSView {
             return
         }
 
-        // 自由曲线才允许抓整条曲线；标准 10 段只做各频段的增益调整。
-        if state?.settings.bandLayout == .freeform, curveDistance(from: p) <= 8 {
+        // 两种布局都可整体调整增益；标准 10 段保持中心频率不变。
+        if curveDistance(from: p) <= 8 {
             startCurveDrag(at: p, event: event)
             return
         }
@@ -346,7 +351,8 @@ final class CurveCanvasView: NSView {
         let g = ((db(atY: p.y, in: bounds)) * 10).rounded() / 10
         state.updateBand(id) { band in
             if state.settings.bandLayout == .freeform { band.freq = f }
-            band.gainDB = g
+            band.gainDB = state.settings.bandGainDB(forDisplayedGain: g, at: band.freq)
+            band.enabled = true
         }
         needsDisplay = true
     }
@@ -358,17 +364,17 @@ final class CurveCanvasView: NSView {
     }
 
     private func startCurveDrag(at p: NSPoint, event: NSEvent) {
-        guard let state, state.settings.bandLayout == .freeform,
-              !state.settings.bands.isEmpty else { return }
+        guard let state, !state.settings.bands.isEmpty else { return }
         state.selectBand(nil)
         draggingID = nil
         curveDrag = CurveDrag(baseline: state.settings.bands,
+                              strength: state.settings.effectStrength,
                               start: p,
-                              shiftFreq: event.modifierFlags.contains(.option))
+                              shiftFreq: state.settings.bandLayout == .freeform && event.modifierFlags.contains(.option))
         needsDisplay = true
     }
 
-    /// 纵向拖动 = 全部控制点增益整体平移；按住 ⌥ 横向拖动 = 频率整体等比缩放。
+    /// 纵向拖动 = 相对 0 dB 调整整体音效强度；按住 ⌥ 横向拖动 = 频率整体等比缩放。
     /// 始终以拖动开始时的快照为基准计算，曲线形状不会因为多次事件累积而漂移。
     private func applyCurveDrag(_ drag: CurveDrag, to p: NSPoint) {
         guard let state else { return }
@@ -380,12 +386,9 @@ final class CurveCanvasView: NSView {
             let shifted = CurveShift.apply(drag.baseline, deltaDB: 0, ratio: nowF / startF)
             state.setBands(shifted)
         } else {
-            let raw = db(atY: p.y, in: bounds) - db(atY: drag.start.y, in: bounds)
-            let limits = CurveShift.allowedDeltaDB(drag.baseline)
-            let rounded = (raw * 10).rounded() / 10
-            let delta = min(max(rounded, limits.lowerBound), limits.upperBound)
-            let shifted = CurveShift.apply(drag.baseline, deltaDB: delta, ratio: 1)
-            state.setBands(shifted)
+            // 上下约半个画布高度对应 100% 强度，围绕 0 dB 改变频段差异。
+            let delta = Float((p.y - drag.start.y) / max(bounds.height * 0.5, 1))
+            state.setEffectStrength(drag.strength + delta)
         }
         needsDisplay = true
     }
@@ -396,7 +399,7 @@ final class CurveCanvasView: NSView {
               state.settings.bands.count < EQSettings.maxBands else { return }
         let f = roundFreq(freq(atX: p.x, in: bounds))
         let g = ((db(atY: p.y, in: bounds)) * 10).rounded() / 10
-        state.addBand(freq: f, gainDB: g)
+        state.addBand(freq: f, gainDB: state.settings.bandGainDB(forDisplayedGain: g, at: f))
         needsDisplay = true
     }
 
@@ -416,8 +419,7 @@ final class CurveCanvasView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let node = band(at: p)
-        let onCurve = node == nil && state?.settings.bandLayout == .freeform
-            && curveDistance(from: p) <= 8
+        let onCurve = node == nil && curveDistance(from: p) <= 8
         if node?.id != hoverID || onCurve != hoveringCurve {
             hoverID = node?.id
             hoveringCurve = onCurve
@@ -530,7 +532,7 @@ final class CurveCanvasView: NSView {
 
     @objc private func menuAddBand() {
         guard let state, let f = contextAddFreq else { return }
-        state.addBand(freq: f, gainDB: contextAddGain)
+        state.addBand(freq: f, gainDB: state.settings.bandGainDB(forDisplayedGain: contextAddGain, at: f))
         needsDisplay = true
     }
 
@@ -565,7 +567,7 @@ final class CurveCanvasView: NSView {
     private func band(at p: NSPoint) -> Band? {
         guard let state else { return nil }
         return state.settings.bands.last { b in
-            let bp = NSPoint(x: x(for: b.freq, in: bounds), y: y(for: b.gainDB, in: bounds))
+            let bp = NSPoint(x: x(for: b.freq, in: bounds), y: y(for: state.settings.displayedGainDB(for: b), in: bounds))
             return hypot(bp.x - p.x, bp.y - p.y) <= 10
         }
     }
@@ -580,8 +582,8 @@ final class CurveCanvasView: NSView {
     /// 提升用橙色、衰减用蓝色、0 dB 用灰色
     private func nodeColor(_ b: Band) -> NSColor {
         if !b.enabled { return .secondaryLabelColor }
-        if b.gainDB > 0.05 { return .systemOrange }
-        if b.gainDB < -0.05 { return .systemBlue }
+        if (state?.settings.displayedGainDB(for: b) ?? b.gainDB) > 0.05 { return .systemOrange }
+        if (state?.settings.displayedGainDB(for: b) ?? b.gainDB) < -0.05 { return .systemBlue }
         return .systemGray
     }
 
